@@ -8,7 +8,10 @@ Un provider spento non viene letto affatto. Se la chiave ha gia' un valore (un
 proxy, un gateway), il blocco vince: il valore va in usage-guard.saved.json
 prima di scrivere e torna identico allo sblocco.
 
-  Claude   `claude -p /usage` (comando locale, zero token)
+  Claude   GET api.anthropic.com/api/oauth/usage col token OAuth di Claude Code
+           (~/.claude/.credentials.json, solo letto: il refresh lo fa Claude Code),
+           da 1 a 17 s misurati; se fallisce, `claude -p /usage` (comando locale, zero
+           token). Fonte in config: auto (API, poi CLI), api, cli.
            blocco: env.ANTHROPIC_BASE_URL in ~/.claude/settings.json, anche
            sulle sessioni gia' aperte. Lo sblocco rimette il valore di prima o,
            se la chiave non c'era, l'URL di default: le sessioni aperte
@@ -51,15 +54,24 @@ import os
 import queue
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import tomllib
-from datetime import datetime
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+try:
+    import truststore  # certificati verificati da Windows, come curl ed Edge
+except ImportError:
+    truststore = None
+
+HERE =os.path.dirname(os.path.abspath(__file__))
 DIR = os.path.join(os.path.expanduser("~"), ".claude")
 CONF = os.path.join(DIR, "usage-guard.json")
 STATE = os.path.join(DIR, "usage-guard.state.json")
@@ -68,11 +80,14 @@ SAVED = os.path.join(DIR, "usage-guard.saved.json")  # valori d'altri sostituiti
 LEGACY_CONF = os.path.join(DIR, "usage-guard.conf")    # versione bash
 LEGACY_STATE = os.path.join(DIR, "usage-guard.state")  # versione bash
 SESSIONS = os.path.join(DIR, "sessions")  # un <pid>.json per sessione di Claude Code
+CREDENTIALS = os.path.join(DIR, ".credentials.json")  # token OAuth di Claude Code, solo letto
 LOG_MAX = 1 << 20
 POLL_TIMEOUT = 120
+API_TIMEOUT = 15
 CODEX_TIMEOUT = 90  # l'app-server impiega ~20s solo a partire
 SEND_TIMEOUT = 180
-NEAR, NEAR_INTERVAL = 10, 45  # Claude a meno di NEAR punti dalla soglia: un poll ogni NEAR_INTERVAL s
+MONTHS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
+                                      "Nov", "Dec"), 1)}  # il testo di /usage e' in inglese
 
 # https: se qualcosa ascoltasse sulla porta 9, il TLS fallirebbe prima che partano
 # gli header col token. Il proxy invece resta http: il token viaggia dentro il
@@ -80,6 +95,10 @@ NEAR, NEAR_INTERVAL = 10, 45  # Claude a meno di NEAR punti dalla soglia: un pol
 BLOCK_URL = "https://127.0.0.1:9"
 BLOCK_PROXY = "http://127.0.0.1:9"
 DEFAULT_URL = "https://api.anthropic.com"  # Claude: lo sblocco lo scrive al posto della chiave assente
+# Diretto, non da ANTHROPIC_BASE_URL: il blocco non lo ferma, si legge anche da bloccati
+USAGE_URL = DEFAULT_URL + "/api/oauth/usage"
+OAUTH_BETA = "oauth-2025-04-20"
+SOURCES = ("auto", "api", "cli")  # auto: API, se fallisce claude -p /usage
 LEGACY_BLOCK = ("http://127.0.0.1:9",)  # della versione bash: si riconosce e si toglie
 NOWIN = subprocess.CREATE_NO_WINDOW
 
@@ -98,8 +117,9 @@ DEFAULTS = {
     "setup_done": False,  # falso: il widget chiede quali provider attivare
     "claude": {"enabled": True, "block": True, "limit": 100, "interval": 120,
                "extra_limit": 0, "currency": "", "skip": "",
-               "settings": "~/.claude/settings.json",
-               "pause": 0, "resume": True},  # pause 0: spenta
+               "settings": "~/.claude/settings.json", "source": "auto",
+               "pause": 0, "resume": True,  # pause 0: spenta
+               "near": 10, "near_interval": 60},  # a meno di near punti dalla soglia, un poll ogni near_interval s
     "codex": {"enabled": False, "block": False, "limit": 100, "interval": 600,
               "config": "~/.codex/config.toml", "binary": ""},
     "copilot": {"enabled": False, "block": False, "limit": 100, "interval": 300,
@@ -109,6 +129,7 @@ DEFAULTS = {
 }
 # Un valore fuori range e' una digitazione a meta' (1 verso 120): non si applica
 RANGES = {"limit": (1, 100), "interval": (30, 86400)}
+CLAUDE_RANGES = {"pause": (0, 100), "near": (0, 50), "near_interval": (30, 3600)}  # solo dove la chiave c'e'
 
 _state_lock = threading.Lock()
 
@@ -323,8 +344,11 @@ def config_errors(pc):
             errs.append(f"{key} deve essere un intero da {lo} a {hi}, e' {pc.get(key)!r}")
     if "extra_limit" in pc and not (isinstance(pc["extra_limit"], (int, float)) and pc["extra_limit"] >= 0):
         errs.append(f"extra_limit deve essere una cifra >= 0, e' {pc['extra_limit']!r}")
-    if "pause" in pc and not (isinstance(pc["pause"], int) and 0 <= pc["pause"] <= 100):
-        errs.append(f"pause deve essere un intero da 0 a 100, e' {pc['pause']!r}")
+    for key, (lo, hi) in CLAUDE_RANGES.items():
+        if key in pc and not (isinstance(pc[key], int) and lo <= pc[key] <= hi):
+            errs.append(f"{key} deve essere un intero da {lo} a {hi}, e' {pc[key]!r}")
+    if pc.get("source", "auto") not in SOURCES:
+        errs.append(f"source deve essere {', '.join(SOURCES)}, e' {pc['source']!r}")
     try:
         re.compile(pc.get("skip") or "")
     except re.error as e:
@@ -608,6 +632,115 @@ def unblocked_settings(pc):
 # Ogni lettore ritorna: windows [[label, percent, reset_epoch]], credits (testo),
 # mode, note, e per Claude used_cents e currency dei credits extra.
 def read_claude(pc, blocked):
+    """Fonte da config: auto prova l'API e, se fallisce, claude -p /usage; api e cli solo quella."""
+    src = pc.get("source") or "auto"
+    if src == "cli":
+        return read_claude_cli(pc, blocked)
+    wait = to_int(load_state().get("claude", {}).get("api_backoff")) - now()
+    try:
+        if wait > 0:
+            raise PollError(f"in pausa dopo un 429, ancora {fmt_left(wait)}")
+        return read_claude_api()
+    except PollError as e:
+        if src == "api":
+            raise
+        api_err = str(e)
+    try:
+        r = read_claude_cli(pc, blocked)
+    except PollError as e:
+        raise PollError(f"API: {api_err}; claude -p: {e}")
+    r["note"] = "; ".join(n for n in (f"API: {api_err}, letto da claude -p", r["note"]) if n)
+    return r
+
+
+def oauth_token():
+    """Access token di Claude Code. Solo letto: il refresh token ruota a ogni uso, un refresh da
+    qui farebbe a gara con Claude Code e lo potrebbe sloggare. Scaduto, lo rinnova il prossimo
+    claude -p, cioe' il fallback."""
+    try:
+        o = json.loads(read_text(CREDENTIALS)).get("claudeAiOauth") or {}
+    except FileNotFoundError:
+        raise PollError("credenziali OAuth di Claude Code assenti")
+    except (OSError, ValueError, AttributeError) as e:
+        raise PollError(f"credenziali OAuth illeggibili: {type(e).__name__}")
+    if not isinstance(o, dict) or not o.get("accessToken"):
+        raise PollError("nessun access token OAuth nelle credenziali")
+    if to_int(o.get("expiresAt")) // 1000 <= now():
+        raise PollError("token OAuth scaduto, lo rinnova Claude Code")
+    return o["accessToken"]
+
+
+def tls_context():
+    """Su alcune connessioni il proxy aziendale che ispeziona il TLS firma con una CA che Windows
+    accetta e Python 3.13 no: Basic Constraints non critico, scartato da VERIFY_X509_STRICT
+    (2 chiamate su 5 il 2026-10-24). Con truststore verifica Windows; senza, si toglie solo quel
+    controllo: catena e hostname restano verificati, come in Python 3.12."""
+    if truststore:
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx = ssl.create_default_context()
+    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    return ctx
+
+
+def read_claude_api():
+    """Lo stesso JSON della pagina Usage di claude.ai (limits[] ed extra_usage): da 1 a 17 s
+    misurati il 2026-10-24, contro i 20-120 di claude -p. Negli errori solo lo stato HTTP: mai il token."""
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {oauth_token()}", "anthropic-beta": OAUTH_BETA,
+        "Accept": "application/json", "User-Agent": "usage-guard/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT, context=tls_context()) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            wait = to_int(e.headers.get("Retry-After")) or 300
+            update_state("claude", api_backoff=now() + wait)
+            raise PollError(f"troppe richieste (429), API in pausa per {fmt_left(wait)}")
+        raise PollError({401: "token OAuth scaduto o revocato (401)",
+                         403: "token OAuth senza permesso (403)"}.get(e.code, f"HTTP {e.code}"))
+    except (urllib.error.URLError, OSError) as e:
+        raise PollError(f"non raggiungibile: {getattr(e, 'reason', e)}")
+    except ValueError as e:
+        raise PollError(f"risposta non JSON: {e}")
+    if not isinstance(body, dict):
+        raise PollError("risposta senza oggetto JSON")
+    r = {"windows": limit_windows(body.get("limits")), "note": ""}
+    if not r["windows"]:
+        raise PollError("risposta senza finestre in limits")
+    x = body.get("extra_usage") or {}
+    extra_credits(x, r)
+    # Il JSON non dice se si e' in overage: lo si deduce come il testo di /usage, una finestra al
+    # 100% con gli extra attivi. Dedotto: al 2026-10-24 mai vista una risposta in overage.
+    over = x.get("is_enabled") and any(w[1] >= 100 for w in r["windows"])
+    r["mode"] = "overages" if over else "subscription"
+    return r
+
+
+def limit_windows(limits):
+    """[[label, percent, reset_epoch]] da limits[], uguale nell'usage_report di claude -p e
+    nella risposta HTTP."""
+    out = []
+    for lim in limits if isinstance(limits, list) else []:
+        if not isinstance(lim, dict) or not isinstance(lim.get("percent"), (int, float)):
+            continue
+        base = "week" if lim.get("group") == "weekly" else lim.get("group") or lim.get("kind") or "window"
+        model = ((lim.get("scope") or {}).get("model") or {}).get("display_name")
+        out.append([f"{base}({model})" if model else base, int(lim["percent"]), iso_epoch(lim.get("resets_at"))])
+    return out
+
+
+def extra_credits(x, r):
+    """used_cents, currency e il testo credits da extra_usage, se attivi."""
+    if x.get("is_enabled") and isinstance(x.get("used_credits"), (int, float)):
+        used = round(x["used_credits"])
+        lim = x["monthly_limit"] if isinstance(x.get("monthly_limit"), (int, float)) else 0
+        pct = x["utilization"] if isinstance(x.get("utilization"), (int, float)) else (used / lim * 100 if lim > 0 else 0)
+        cur = (x.get("currency") or "USD").upper()
+        r.update(used_cents=used, currency=cur,
+                 credits=f"{money(used, cur)}/{money(lim, cur) if lim > 0 else 'illimitato'}({int(pct)}%)")
+
+
+def read_claude_cli(pc, blocked):
     exe = shutil.which("claude")
     if not exe:
         raise PollError("claude non trovato nel PATH")
@@ -642,26 +775,41 @@ def read_claude(pc, blocked):
     r = {"windows": [], "mode": "overages" if "using your overages" in text else "subscription", "note": ""}
     rl = (rep or {}).get("rate_limits") or {}
     if isinstance(rl.get("limits"), list):
-        for lim in rl["limits"]:
-            if not isinstance(lim.get("percent"), (int, float)):
-                continue
-            base = "week" if lim.get("group") == "weekly" else lim.get("group") or lim.get("kind") or "window"
-            model = ((lim.get("scope") or {}).get("model") or {}).get("display_name")
-            r["windows"].append([f"{base}({model})" if model else base, int(lim["percent"]), iso_epoch(lim.get("resets_at"))])
+        r["windows"] = limit_windows(rl["limits"])
     else:
-        for m in re.finditer(r"^Current ([^:]+): (\d+)% used", text, re.M):
+        # "Current session: 91% used · resets Oct 24, 11:09pm (Europe/Rome)"
+        for m in re.finditer(r"^Current ([^:]+): (\d+)% used(?:[^\n]*?resets ([^\n(]+?)\s*\(([^)\n]+)\))?",
+                             text, re.M):
             label = re.sub(r"^week \((.*)\)$", r"week(\1)", m.group(1)).replace(" ", "")
-            r["windows"].append([label, int(m.group(2)), 0])
-        r["note"] = "usage_report assente, letto il testo: niente orari di reset ne' credits"
-    x = rl.get("extra_usage") or {}
-    if x.get("is_enabled") and isinstance(x.get("used_credits"), (int, float)):
-        used = round(x["used_credits"])
-        lim = x["monthly_limit"] if isinstance(x.get("monthly_limit"), (int, float)) else 0
-        pct = x["utilization"] if isinstance(x.get("utilization"), (int, float)) else (used / lim * 100 if lim > 0 else 0)
-        cur = (x.get("currency") or "USD").upper()
-        r.update(used_cents=used, currency=cur,
-                 credits=f"{money(used, cur)}/{money(lim, cur) if lim > 0 else 'illimitato'}({int(pct)}%)")
+            r["windows"].append([label, int(m.group(2)), text_reset(m.group(3), m.group(4))])
+        r["note"] = "usage_report senza limits, finestre lette dal testo di /usage" + (
+            "" if all(w[2] for w in r["windows"]) else ": orario di reset non letto")
+    extra_credits(rl.get("extra_usage") or {}, r)
     return r
+
+
+def text_reset(when, tz):
+    """'Oct 24, 11:09pm' o '5pm', nel fuso tz, dal testo di /usage: epoch, 0 se non si legge.
+    Senza anno: quello corrente, o il prossimo se la data e' passata da piu' di un giorno."""
+    m = re.fullmatch(r"(?:([A-Za-z]{3}) (\d{1,2}),?\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)", (when or "").strip(), re.I)
+    if not m or (m.group(1) and m.group(1).title() not in MONTHS):
+        return 0
+    try:
+        zone = ZoneInfo(tz.strip()) if tz else None
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        zone = None  # senza tzdata: l'ora locale, che e' quella in cui il CLI scrive
+    today = datetime.now(zone)
+    month, day = (MONTHS[m.group(1).title()], int(m.group(2))) if m.group(1) else (today.month, today.day)
+    hour = int(m.group(3)) % 12 + (12 if m.group(5).lower() == "pm" else 0)
+    try:
+        dt = datetime(today.year, month, day, hour, int(m.group(4) or 0), tzinfo=zone)
+        if not m.group(1) and dt.timestamp() <= now():
+            dt += timedelta(days=1)  # solo l'ora, gia' passata: e' domani
+        elif dt.timestamp() < now() - 86400:
+            dt = dt.replace(year=dt.year + 1)
+    except ValueError:
+        return 0
+    return int(dt.timestamp())
 
 
 def codex_exe(pc):
@@ -1033,15 +1181,17 @@ def decide(name, pc, r):
 
 
 def interval(name, pc, st):
-    """Secondi fra due poll. Claude vicino alla soglia (la pausa, o il blocco se la pausa e'
-    spenta) e non ancora bloccato: NEAR_INTERVAL. A 1%/min, 120s piu' un /usage in timeout
-    arrivavano alla soglia gia' 4-5 punti oltre (2026-10-18, pausa a 93% scattata a 96%).
-    Bloccato si torna all'intervallo normale: si aspetta solo il reset."""
-    if name != "claude" or st.get("blocked") == 1:
+    """Secondi fra due poll. Claude a meno di near punti dalla soglia (la pausa, o il blocco se
+    la pausa e' spenta) e non ancora bloccato: near_interval. A 1%/min, 120s piu' un /usage in
+    timeout arrivavano alla soglia gia' 4-5 punti oltre (2026-10-18, pausa a 93% scattata a 96%);
+    45s pero' sull'API danno 429 dopo ~17 minuti (2026-10-24), 300s mai: default 60.
+    Bloccato si torna all'intervallo normale: si aspetta solo il reset. near 0: mai veloce."""
+    if name != "claude" or st.get("blocked") == 1 or not pc.get("near"):
         return pc["interval"]
     skip = re.compile(pc["skip"], re.I) if pc.get("skip") else None
     top = max((w[1] for w in st.get("windows") or [] if not (skip and skip.search(w[0]))), default=0)
-    return min(pc["interval"], NEAR_INTERVAL) if top >= (pc.get("pause") or pc["limit"]) - NEAR else pc["interval"]
+    near = top >= (pc.get("pause") or pc["limit"]) - pc["near"]
+    return min(pc["interval"], pc["near_interval"]) if near else pc["interval"]
 
 
 def poll(name, force=False):

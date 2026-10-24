@@ -9,7 +9,9 @@ processo, ciascuno al suo intervallo; un provider spento non viene letto. Se un
 
 Si avvia con claude-usage-guard.sh o `python usage_guard.py`; rilanciato col
 widget aperto, lo porta in alto a destra del monitor del mouse. Tasto sinistro
-trascina, tasto destro apre il menu. Al primo avvio chiede quali provider
+trascina, tasto destro apre il menu. In Impostazioni, scheda Posizione: aggancio a
+un punto del monitor, lato fisso del box, allineamento del testo, margini e
+padding, con i disegni che cambiano subito. Al primo avvio chiede quali provider
 controllare. Preferenze del widget in ~/.claude/usage-guard.widget, dei
 provider in ~/.claude/usage-guard.json.
 """
@@ -25,6 +27,7 @@ import threading
 import time
 import traceback
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,18 +41,35 @@ BG, BG_BLOCK = "#1e1e1e", "#6b1414"
 # l'antialiasing del testo fa un bordo scuro che si legge su ogni sfondo.
 KEY = "#1e1e1f"
 FG, DIM, OK, WARN, BAD = "#d4d4d4", "#8a8a8a", "#89d185", "#e5c07b", "#f14c4c"
+PANEL, FAINT = "#141414", "#555555"  # disegni delle Impostazioni: fondo, e linee che non contano
 
 LABELS = {"S, W": ("S", "W"), "Session, W": ("Session", "W"), "Session, Week": ("Session", "Week")}
+# Aggancio: punto del monitor -> lati fissi del box, orizzontale e verticale
+DOCKS = {"tl": ("left", "top"), "tc": ("center", "top"), "tr": ("right", "top"),
+         "bl": ("left", "bottom"), "bc": ("center", "bottom"), "br": ("right", "bottom")}
+DOCK_NAMES = {"tl": "in alto a sinistra", "tc": "in alto al centro", "tr": "in alto a destra",
+              "bl": "in basso a sinistra", "bc": "in basso al centro", "br": "in basso a destra"}
 DEFAULTS = {
-    "x": None, "y": None,
+    "x": None, "y": None,  # il punto fisso del box (align, valign), non l'angolo in alto a sinistra
     "show_session": True, "show_reset": True, "show_credits": True, "show_overage": True,
     "hidden": [],  # "provider:finestra" nascoste: una finestra nuova si vede
     "labels": "Session, W",
     "transp": 0, "font": 9, "topmost": True, "warn": 80,
+    "dock": "free", "align": "right", "valign": "top", "text_align": "center",
+    "margin_x": 8, "margin_y": 8, "pad_x": 5, "pad_y": 2,
 }
 # Un valore fuori range e' una digitazione a meta' (1 verso 120): non si applica
 # font da 1: in Tk 0 e' il font di default e un negativo e' in pixel
-RANGES = {"transp": (0, 100), "font": (1, 20), "warn": (1, 100)}
+RANGES = {"transp": (0, 100), "font": (1, 20), "warn": (1, 100),
+          "margin_x": (0, 400), "margin_y": (0, 400), "pad_x": (0, 50), "pad_y": (0, 50)}
+CHOICES = {"dock": ("free",) + tuple(DOCKS), "align": ("left", "center", "right"),
+           "valign": ("top", "bottom"), "text_align": ("left", "center", "right")}
+SHARE = {"left": 0, "top": 0, "center": 0.5, "right": 1, "bottom": 1}  # quota del box prima del punto fisso
+TEXT_ANCHOR = {"left": "w", "center": "center", "right": "e"}
+ALIGN_NAMES = (("left", "Sinistra"), ("center", "Centro"), ("right", "Destra"))
+VALIGN_NAMES = (("top", "Alto"), ("bottom", "Basso"))
+SMALL, SMALL_BOLD = ("Segoe UI", 7), ("Segoe UI", 8, "bold")
+DOCK_W, DOCK_H = 224, 126
 
 
 def num(value, default=0):
@@ -67,17 +87,27 @@ def load_prefs():
     except OSError:
         return prefs
     try:
-        prefs.update(json.loads(raw))
+        saved = json.loads(raw)
     except ValueError:  # formato precedente: "x y trasparenza"
-        prefs.update(zip(("x", "y", "transp"), (num(v) for v in raw.split())))
+        saved = dict(zip(("x", "y", "transp"), (num(v) for v in raw.split())))
+    prefs.update(saved)
+    # x, y salvati prima dell'allineamento sono l'angolo in alto a sinistra: si convertono al
+    # primo disegno, cosi' il widget non si sposta
+    prefs["_topleft"] = "align" not in saved
     prefs.pop("interval", None)  # ora per provider, in usage-guard.json
     # finestre nascoste della versione solo Claude: senza prefisso del provider
     prefs["hidden"] = [h if ":" in h else f"claude:{h}" for h in prefs.get("hidden") or []]
     if prefs["labels"] not in LABELS:
         prefs["labels"] = DEFAULTS["labels"]
     for key, (lo, hi) in RANGES.items():
-        if not lo <= num(prefs[key], -1) <= hi:
+        prefs[key] = num(prefs[key], -1)
+        if not lo <= prefs[key] <= hi:
             prefs[key] = DEFAULTS[key]
+    for key, values in CHOICES.items():
+        if prefs[key] not in values:
+            prefs[key] = DEFAULTS[key]
+    if prefs["dock"] in DOCKS:
+        prefs["align"], prefs["valign"] = DOCKS[prefs["dock"]]  # agganciato: i lati li da' il punto
     return prefs
 
 
@@ -146,6 +176,19 @@ def mouse_corner():
     return r - 420, t + 8
 
 
+def inward(point, p):
+    """Il punto fisso a destra o in basso, con margine 0, cade sul bordo: quel pixel e' gia' del
+    monitor accanto. Uno verso l'interno."""
+    return point[0] - (p["align"] == "right"), point[1] - (p["valign"] == "bottom")
+
+
+def dock_point(p, l, t, r, b):
+    """Punto fisso del box agganciato: il lato del monitor dato da align e valign, ai margini."""
+    x = {"left": l + p["margin_x"], "center": (l + r) // 2, "right": r - p["margin_x"]}[p["align"]]
+    y = {"top": t + p["margin_y"], "bottom": b - p["margin_y"]}[p["valign"]]
+    return x, y
+
+
 def foreground_blocks_raise(own):
     """Vero se in primo piano c'e' una finestra topmost che non va coperta: Start,
     calendario, impostazioni rapide, un altro programma sempre in primo piano, o la
@@ -174,6 +217,9 @@ class Widget:
         self.cfg_err, self.shown, self.running, self.last_run, self.errs = "", None, set(), {}, {}
         self.p, self.win, self.win_vars, self.save_job, self.cfg_job = load_prefs(), None, [], None, None
         self.geom, self.menu_open, self.moved = None, False, False
+        self.rows, self.editing, self.edit_close = [], False, None
+        self.layout_vars, self.layout_radios, self.dock_canvas, self.box_canvas = {}, [], None, None
+        self.anchor, self.topleft = None, None  # punto fisso del box, o angolo da convertire
         root = self.root = tk.Tk()
         top = self.top = tk.Toplevel(root)
         for win in (root, top):
@@ -182,7 +228,7 @@ class Widget:
         top.configure(bg=KEY)
         top.attributes("-transparentcolor", KEY)
         root.report_callback_exception = self.crash
-        self.frame = tk.Frame(top, bg=KEY, padx=5, pady=2)
+        self.frame = tk.Frame(top, bg=KEY)  # padding da apply()
         self.frame.pack()
         self.menu = tk.Menu(root, tearoff=0)
         self.menu.add_command(label="Poll ora", command=self.poll_now)
@@ -196,7 +242,7 @@ class Widget:
         self.menu.add_command(label="Chiudi", command=root.destroy)
         self.reload()
         self.apply()
-        self.anchor = self.start_pos()
+        self.start_pos()
         self.place()
         root.update()
         # sfondo prima, testo dopo: nello z-order il testo resta sopra
@@ -218,21 +264,54 @@ class Widget:
 
     def start_pos(self):
         x, y = self.p["x"], self.p["y"]
-        if isinstance(x, int) and isinstance(y, int):
-            return x, y  # ci pensa place() a tenerlo dentro il monitor
-        return self.root.winfo_screenwidth() - 420, 8
+        legacy = self.p.pop("_topleft", False)
+        if not (isinstance(x, int) and isinstance(y, int)):
+            self.topleft = self.root.winfo_screenwidth() - 420, 8  # primo avvio
+        elif legacy:
+            self.topleft = x, y
+        else:
+            self.anchor = x, y  # ci pensa place() a tenerlo dentro il monitor
+
+    def fixed(self, x, y, w, h):
+        """Punto fisso del box che ha l'angolo in alto a sinistra in (x, y)."""
+        return x + round(w * SHARE[self.p["align"]]), y + round(h * SHARE[self.p["valign"]])
+
+    def origin(self, w, h):
+        """Angolo in alto a sinistra del box, dal punto fisso."""
+        fx, fy = self.anchor
+        return fx - round(w * SHARE[self.p["align"]]), fy - round(h * SHARE[self.p["valign"]])
 
     def place(self):
-        # anchor e' dove l'hai messo; qui si sposta solo quel che serve per stare
-        # nel monitor. Una riga larga per poco non lo trascina via per sempre.
+        # anchor e' il punto fisso del box, dove l'hai messo o dove l'hai agganciato: il box cresce
+        # e si stringe attorno a quello. Qui si sposta solo quel che serve per stare nel monitor:
+        # una riga larga per poco non lo trascina via per sempre.
         w, h = self.frame.winfo_reqwidth(), self.frame.winfo_reqheight()
-        x, y = self.anchor
-        if not attached(x, y, w, h):
+        p = self.p
+        if p["dock"] != "free":
+            # agganciato: il punto fisso e' il punto d'aggancio del monitor dove sta il widget
+            ref = inward(self.anchor, p) if self.anchor else self.topleft or mouse_corner()
+            self.topleft = None
+            fixed = dock_point(p, *monitor_rect(*ref))
+            if fixed != self.anchor:
+                self.anchor = fixed
+                self.save_prefs()
+        elif self.topleft:
+            # angolo in alto a sinistra (primo avvio, versione precedente, rilancio, cambio di lato
+            # fisso): al primo disegno con le righe vere diventa il punto fisso, e il box non si muove
+            x, y = self.topleft
+            if self.shown is not None:
+                self.topleft = None
+                self.anchor = self.fixed(x, y, w, h)
+                self.save_prefs()
+        if not self.topleft:
+            x, y = self.origin(w, h)
+        if p["dock"] == "free" and not attached(x, y, w, h):
             # monitor staccato: il clamp lo lascerebbe nell'angolo piu' vicino. Si salva,
             # cosi' il monitor che torna non lo riporta via.
             x, y = mouse_corner()
-            if (x, y) != self.anchor:  # senza nessun monitor non riscrive a ogni tick
-                self.anchor = x, y
+            fixed = self.fixed(x, y, w, h)
+            if fixed != self.anchor:  # senza nessun monitor non riscrive a ogni tick
+                self.anchor, self.topleft = fixed, None
                 self.save_prefs()
         l, t, r, b = monitor_rect(x + w // 2, y + h // 2)
         x, y = min(max(x, l), r - w), min(max(y, t), b - h)
@@ -258,13 +337,18 @@ class Widget:
         self.moved = False
 
     def drag(self, e):
-        self.anchor, self.moved = (e.x_root - self.dx, e.y_root - self.dy), True
+        if self.p["dock"] != "free":
+            self.p["dock"] = "free"  # trascinato via dall'aggancio: torna libero dove lo lasci
+        w, h = self.frame.winfo_reqwidth(), self.frame.winfo_reqheight()
+        self.topleft = None
+        self.anchor, self.moved = self.fixed(e.x_root - self.dx, e.y_root - self.dy, w, h), True
         self.place()
 
     def release(self, _e):
         if self.moved:
-            self.anchor = self.geom[:2]  # trascinato oltre il bordo: resta dove lo vedi
+            self.anchor = self.fixed(*self.geom)  # trascinato oltre il bordo: resta dove lo vedi
             self.save_prefs()
+            self.draw_layout()
 
     def popup(self, e):
         on = [n for n in ug.PROVIDERS if self.cfg[n]["enabled"]]
@@ -309,11 +393,13 @@ class Widget:
         self.root.attributes("-alpha", max(0.01, 1 - p["transp"] / 100))
         for win in (self.root, self.top):
             win.attributes("-topmost", bool(p["topmost"]))
+        self.frame.configure(padx=p["pad_x"], pady=p["pad_y"])
         self.shown = None
 
     def save_prefs(self):
         self.save_job = None
-        self.p["x"], self.p["y"] = self.anchor
+        if self.anchor:  # prima del primo disegno c'e' solo l'angolo da convertire
+            self.p["x"], self.p["y"] = self.anchor
         try:
             with open(PREFS, "w", encoding="utf-8") as f:
                 json.dump(self.p, f, indent=1)
@@ -323,8 +409,11 @@ class Widget:
     def set_pref(self, key, value):
         if key in RANGES and not RANGES[key][0] <= value <= RANGES[key][1]:
             return
+        if key in CHOICES and value not in CHOICES[key]:
+            return
         self.p[key] = value
         self.apply()
+        self.render(time.time())  # il widget e i disegni cambiano subito, non al prossimo tick
         # lo slider manda decine di valori al secondo: si salva a mano ferma
         if self.save_job:
             self.root.after_cancel(self.save_job)
@@ -335,7 +424,11 @@ class Widget:
         pc = self.cfg[name]
         if key in ug.RANGES and not ug.RANGES[key][0] <= value <= ug.RANGES[key][1]:
             return
-        if key == "extra_limit" and value < 0 or key == "pause" and not 0 <= value <= 100:
+        if key == "extra_limit" and value < 0:
+            return
+        if key in ug.CLAUDE_RANGES and not ug.CLAUDE_RANGES[key][0] <= value <= ug.CLAUDE_RANGES[key][1]:
+            return
+        if key == "source" and value not in ug.SOURCES:
             return
         was = pc.get(key)
         pc[key] = value
@@ -360,6 +453,9 @@ class Widget:
             self.win.lift()
             return
         w = self.win = tk.Toplevel(self.root)
+        # i disegni e il campo aperti erano della finestra chiusa
+        self.dock_canvas = self.box_canvas = self.edit_close = None
+        self.editing = False
         w.withdraw()  # si mostra dopo, gia' al suo posto
         w.title("usage guard")
         w.resizable(False, False)
@@ -371,10 +467,10 @@ class Widget:
         nb = ttk.Notebook(w)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
         self.widget_tab(nb)
-        for name in ug.PROVIDERS:
-            self.provider_tab(nb, name)
+        self.layout_tab(nb)
+        tabs = {name: self.provider_tab(nb, name) for name in ug.PROVIDERS}
         if first:
-            nb.select(1)
+            nb.select(tabs["claude"])
 
         def close():
             if first:
@@ -452,6 +548,191 @@ class Widget:
         tk.Label(box, text="Rosso al 100% del limite di ciascun provider.",
                  fg="gray40").grid(row=4, column=0, columnspan=2, sticky="w")
 
+    # --- scheda Posizione ------------------------------------------------------
+    def layout_tab(self, nb):
+        tab = tk.Frame(nb, padx=6, pady=4)
+        nb.add(tab, text="Posizione")
+        box = tk.LabelFrame(tab, text="Aggancio", padx=8, pady=4)
+        box.grid(row=0, column=0, sticky="ew", padx=2, pady=3)
+        self.dock_canvas = tk.Canvas(box, width=DOCK_W, height=DOCK_H, bg=PANEL, highlightthickness=0)
+        self.dock_canvas.pack(anchor="w")
+        self.dock_caption = tk.Label(box, fg="gray40", justify="left", wraplength=380)
+        self.dock_caption.pack(anchor="w")
+        box = tk.LabelFrame(tab, text="Box e testo", padx=8, pady=4)
+        box.grid(row=1, column=0, sticky="ew", padx=2, pady=3)
+        self.box_canvas = tk.Canvas(box, bg=PANEL, highlightthickness=0)
+        self.box_canvas.pack(anchor="w")
+        self.box_caption = tk.Label(box, fg="gray40", justify="left", wraplength=380)
+        self.box_caption.pack(anchor="w")
+        radios = tk.Frame(box)
+        radios.pack(anchor="w", pady=(4, 0))
+        self.layout_vars, self.layout_radios = {}, []
+        for row, (key, text, opts) in enumerate((("align", "Box fisso a", ALIGN_NAMES),
+                                                 ("valign", "Verticale", VALIGN_NAMES),
+                                                 ("text_align", "Testo", ALIGN_NAMES))):
+            tk.Label(radios, text=text).grid(row=row, column=0, sticky="w", padx=(0, 6))
+            v = self.layout_vars[key] = self.bound(tk.StringVar, self.p[key],
+                                                   lambda val, key=key: self.set_layout(key, val))
+            for col, (value, label) in enumerate(opts, 1):
+                rb = tk.Radiobutton(radios, text=label, value=value, variable=v)
+                rb.grid(row=row, column=col, sticky="w")
+                if key != "text_align":
+                    self.layout_radios.append(rb)  # agganciato li decide il punto: spenti
+        self.draw_layout()
+
+    def set_layout(self, key, value):
+        if self.p.get(key) == value:
+            return
+        if key in ("align", "valign") and self.geom:
+            self.topleft = self.geom[:2]  # il box resta dov'e': cambia solo il lato che sta fermo
+        self.set_pref(key, value)
+
+    def set_dock(self, d):
+        if not self.geom or d == self.p["dock"]:
+            return
+        x, y, w, h = self.geom
+        if d == "free":
+            self.topleft = x, y  # resta dov'e', da qui si trascina
+        else:
+            self.p["align"], self.p["valign"] = DOCKS[d]
+            self.anchor, self.topleft = (x + w // 2, y + h // 2), None  # il monitor dove sta ora
+        self.set_pref("dock", d)
+
+    def draw_layout(self):
+        """I due disegni della scheda Posizione, rifatti a ogni cambio."""
+        if self.editing or not (self.win and self.win.winfo_exists() and self.box_canvas):
+            return
+        free = self.p["dock"] == "free"
+        for rb in self.layout_radios:
+            rb.configure(state="normal" if free else "disabled")
+        for key, v in self.layout_vars.items():
+            if v.get() != self.p[key]:
+                v.set(self.p[key])  # cambiati dal punto d'aggancio, o a mano nel file
+        self.draw_dock(self.dock_canvas)
+        self.draw_box(self.box_canvas)
+
+    def draw_dock(self, c):
+        """Il monitor con i 7 punti: 6 d'aggancio sul bordo, al centro Libero. Il rettangolo
+        pieno e' il widget, in scala, dove sta ora."""
+        c.delete("all")
+        w, h, p = DOCK_W, DOCK_H, self.p
+        c.create_rectangle(1, 1, w - 2, h - 2, outline=DIM)
+        c.create_text(6, h / 2, text="monitor", anchor="w", fill=DIM, font=SMALL)  # a meta' lato: niente punti
+        if self.geom:
+            x, y, ww, wh = self.geom
+            l, t, r, b = monitor_rect(x + ww // 2, y + wh // 2)
+            sx, sy = (w - 3) / max(1, r - l), (h - 3) / max(1, b - t)
+            x0, y0 = 1 + (x - l) * sx, 1 + (y - t) * sy
+            c.create_rectangle(x0, y0, x0 + max(4, ww * sx), y0 + max(3, wh * sy), fill=FG, outline=FG)
+        i = 14
+        spots = {d: ({"l": i, "c": w / 2, "r": w - i}[d[1]], {"t": i, "b": h - i}[d[0]]) for d in DOCKS}
+        spots["free"] = (w / 2, h / 2)
+        for d, (px, py) in spots.items():
+            on = d == p["dock"]
+            rad = 6 if on else 5
+            c.create_oval(px - rad, py - rad, px + rad, py + rad, width=2, tags=("spot", f"spot:{d}"),
+                          fill=WARN if on else PANEL, outline=WARN if on else DIM)
+            c.tag_bind(f"spot:{d}", "<Button-1>", lambda _e, d=d: self.set_dock(d))
+        c.create_text(w / 2, h / 2 + 9, text="libero", anchor="n", font=SMALL,
+                      fill=WARN if p["dock"] == "free" else DIM)
+        c.tag_bind("spot", "<Enter>", lambda _e: c.configure(cursor="hand2"))
+        c.tag_bind("spot", "<Leave>", lambda _e: c.configure(cursor=""))
+        if p["dock"] == "free":
+            text = "Libero: trascina il widget dove vuoi. Clic su un punto del bordo per agganciarlo."
+        else:
+            text = (f"Agganciato {DOCK_NAMES[p['dock']]}, a {p['margin_x']}/{p['margin_y']} px dai bordi. "
+                    "Trascinalo, o clic sul punto centrale, per tornare libero.")
+        self.dock_caption.configure(text=text)
+
+    def draw_box(self, c):
+        """Box model come in DevTools: margine, sfondo col padding, testo. Le fasce non sono in
+        scala, i numeri si'. Il testo e' quello vero del widget, coi suoi colori e il suo font."""
+        c.delete("all")
+        p = self.p
+        font = tkfont.Font(family="Segoe UI", size=p["font"])
+        bold = tkfont.Font(family="Segoe UI", size=p["font"], weight="bold")
+        rows = list(self.rows) or [[("in attesa del primo poll", DIM, False)]]
+        if len(rows) == 1:
+            rows.append([("riga d'esempio", FAINT, False)])  # con una riga sola l'allineamento non si vede
+        widths = [sum((bold if s else font).measure(t) + 6 for t, _fg, s in segs) for segs in rows]
+        line = bold.metrics("linespace")
+        cw, ch = max(widths), line * len(rows)
+        m, pd, o = 30, 24, 3
+        w, h = cw + 2 * (m + pd + o), ch + 2 * (m + pd + o)
+        c.configure(width=w, height=h)
+        free = p["dock"] == "free"
+        mcol = FAINT if free else DIM  # in Libero i margini non contano
+        mx0, my0, mx1, my1 = o, o, w - o, h - o
+        sx0, sy0, sx1, sy1 = mx0 + m, my0 + m, mx1 - m, my1 - m
+        cx0, cy0 = sx0 + pd, sy0 + pd
+        c.create_rectangle(mx0, my0, mx1, my1, outline=mcol, dash=(3, 3))
+        c.create_text(mx0 + 4, my0 + 3, text="margine", anchor="nw", fill=mcol, font=SMALL)
+        c.create_rectangle(sx0, sy0, sx1, sy1, fill=BG, outline=DIM)
+        c.create_text(sx0 + 4, sy0 + 3, text="padding", anchor="nw", fill=OK, font=SMALL)
+        c.create_rectangle(cx0, cy0, cx0 + cw, cy0 + ch, outline=OK, dash=(2, 2))
+        for i, (segs, rw) in enumerate(zip(rows, widths)):
+            x = cx0 + {"left": 0, "center": (cw - rw) / 2, "right": cw - rw}[p["text_align"]]
+            for t, fg, strong in segs:
+                f = bold if strong else font
+                c.create_text(x + 3, cy0 + i * line, text=t, fill=fg, font=f, anchor="nw")
+                x += f.measure(t) + 6
+        mval = FAINT if free else FG
+        for key, x, y, fg in (("margin_y", w / 2, my0 + m / 2, mval), ("margin_y", w / 2, my1 - m / 2, mval),
+                              ("margin_x", mx0 + m / 2, h / 2, mval), ("margin_x", mx1 - m / 2, h / 2, mval),
+                              ("pad_y", w / 2, sy0 + pd / 2, FG), ("pad_y", w / 2, sy1 - pd / 2, FG),
+                              ("pad_x", sx0 + pd / 2, h / 2, FG), ("pad_x", sx1 - pd / 2, h / 2, FG)):
+            c.create_text(x, y, text=str(p[key]), fill=fg, font=SMALL_BOLD, tags=("val", f"val:{key}"))
+        for key in ("margin_x", "margin_y", "pad_x", "pad_y"):
+            c.tag_bind(f"val:{key}", "<Button-1>", lambda _e, key=key: self.edit_value(c, key))
+        c.tag_bind("val", "<Enter>", lambda _e: c.configure(cursor="hand2"))
+        c.tag_bind("val", "<Leave>", lambda _e: c.configure(cursor=""))
+        # il punto che sta fermo: il box cresce e si stringe dagli altri lati
+        fx, fy = sx0 + (sx1 - sx0) * SHARE[p["align"]], sy0 + (sy1 - sy0) * SHARE[p["valign"]]
+        c.create_rectangle(fx - 4, fy - 4, fx + 4, fy + 4, fill=WARN, outline=WARN)
+        grow = {"left": "destra", "center": "entrambi i lati", "right": "sinistra"}[p["align"]]
+        down = {"top": "il basso", "bottom": "l'alto"}[p["valign"]]
+        text = (f"Quadratino giallo: il punto che sta fermo. Il testo piu' lungo allarga il box verso {grow}, "
+                f"una riga in piu' lo allunga verso {down}. Clic su un numero per cambiarlo.")
+        if free:
+            text += " In Libero i margini non contano: valgono da agganciato."
+        self.box_caption.configure(text=text)
+
+    def edit_value(self, c, key):
+        """Clic su un numero del disegno: un campo li' sopra. Invio o clic fuori applica, Esc annulla,
+        un valore fuori range non si applica."""
+        if self.edit_close:
+            self.edit_close(True)  # un altro campo aperto: si chiude prima
+        item = c.find_withtag("current")
+        if not item:
+            return
+        x, y = c.coords(item[0])
+        self.editing = True
+        e = tk.Entry(c, width=4, justify="center")
+        e.insert(0, str(self.p[key]))
+        e.select_range(0, "end")
+        win = c.create_window(x, y, window=e)
+
+        def close(save):
+            if self.edit_close is not close:
+                return  # Invio e poi FocusOut: una volta sola
+            self.editing, self.edit_close = False, None
+            try:
+                value = e.get()
+                c.delete(win)
+                e.destroy()
+            except tk.TclError:
+                return  # Impostazioni chiuse col campo aperto
+            if save:
+                with contextlib.suppress(ValueError):
+                    self.set_pref(key, int(value))
+            self.draw_layout()
+        self.edit_close = close
+        e.bind("<Return>", lambda _e: close(True))
+        e.bind("<KP_Enter>", lambda _e: close(True))
+        e.bind("<Escape>", lambda _e: close(False))
+        e.bind("<FocusOut>", lambda _e: close(True))
+        e.focus_set()
+
     def provider_tab(self, nb, name):
         tab = tk.Frame(nb, padx=10, pady=6)
         nb.add(tab, text=ug.NAMES[name])
@@ -478,6 +759,12 @@ class Widget:
             tk.Entry(tab, textvariable=v, width=52).grid(row=row[0], column=1, sticky="w")
             row[0] += 1
 
+        def choice(text, key, values):
+            tk.Label(tab, text=text).grid(row=row[0], column=0, sticky="w")
+            ttk.Combobox(tab, values=values, state="readonly", width=7,
+                         textvariable=cfg(tk.StringVar, key)).grid(row=row[0], column=1, sticky="w")
+            row[0] += 1
+
         def note(text):
             tk.Label(tab, text=text, fg="gray40", justify="left").grid(
                 row=row[0], column=0, columnspan=2, sticky="w", pady=(4, 0))
@@ -488,16 +775,20 @@ class Widget:
         spin("Limite % delle finestre", "limit", 1, 100)
         spin("Intervallo fra i poll, s", "interval", 30, 86400, inc=30)
         if name == "claude":
+            choice("Fonte dell'uso", "source", ug.SOURCES)
             entry("Tetto extra al mese (0 = niente)", "extra_limit", lambda s: float(s.replace(",", ".")))
             entry("Finestre ignorate (regex)", "skip")
             entry("settings.json", "settings")
             spin("Pausa % (0 = spenta): messaggio alle chat al lavoro", "pause", 0, 100)
+            spin("Poll veloce a meno di N punti dalla soglia (0 = mai)", "near", 0, 50)
+            spin("Intervallo del poll veloce, s", "near_interval", 30, 3600, inc=15)
             check("Al reset manda continue alle chat in pausa o bloccate", "resume")
-            note("Il blocco arriva anche alle sessioni aperte, e lo sblocco pure.\n"
+            note("Fonte auto: API OAuth (pochi secondi), se fallisce claude -p /usage.\n"
+                 "Il blocco arriva anche alle sessioni aperte, e lo sblocco pure.\n"
                  "Oltre il limite si blocca solo a tetto extra raggiunto.\n"
                  "Pausa e continue passano dal messaging fra sessioni:\n"
                  "serve crossSessionInbound \"accept\" in settings.json.\n"
-                 f"A meno di {ug.NEAR} punti dalla soglia il poll passa a {ug.NEAR_INTERVAL}s.")
+                 "Poll veloce sotto i 60 s: l'API risponde 429 (a 45 s dopo ~17 minuti).")
         elif name == "codex":
             entry("config.toml", "config")
             entry("codex.exe (vuoto: dall'estensione VS Code)", "binary")
@@ -514,6 +805,7 @@ class Widget:
         st = self.state.get(name, {})
         if st.get("last") or st.get("err"):
             note(f"Ultimo poll: {st.get('last') or 'nessuno'}" + (f"\nErrore: {st['err']}" if st.get("err") else ""))
+        return tab
 
     # --- poll -----------------------------------------------------------------
     def reload(self):
@@ -585,8 +877,11 @@ class Widget:
                     self.run(name)
             self.render(now)
             if K32.WaitForSingleObject(self.show, 0) == 0:  # WAIT_OBJECT_0: script rilanciato
-                self.anchor = mouse_corner()
-                self.save_prefs()
+                # sul monitor del mouse: libero in alto a destra, agganciato allo stesso punto
+                if self.p["dock"] == "free":
+                    self.topleft = mouse_corner()
+                else:
+                    self.anchor, self.topleft = None, mouse_corner()
             self.place()  # il monitor cambia da solo: risoluzione, monitor staccato
             if self.cfg_err.startswith("errore widget"):
                 self.cfg_err = ""  # tick riuscito: l'errore era di passaggio
@@ -650,19 +945,20 @@ class Widget:
             rows.append([(self.cfg_err[:80], WARN, False)])
         if (blocked, rows) == self.shown:
             return
-        self.shown = (blocked, rows)
+        self.shown, self.rows = (blocked, rows), rows
         self.root.configure(bg=BG_BLOCK if blocked else BG)
         for w in self.frame.winfo_children():
             w.destroy()
         font, bold = ("Segoe UI", self.p["font"]), ("Segoe UI", self.p["font"], "bold")
         for segs in rows:
             line = tk.Frame(self.frame, bg=KEY)
-            line.pack(anchor="w")
+            line.pack(anchor=TEXT_ANCHOR[self.p["text_align"]])
             for text, fg, strong in segs:
                 tk.Label(line, text=text, fg=fg, bg=KEY, font=bold if strong else font,
                          padx=3, pady=0).pack(side="left")
         self.top.update_idletasks()
         self.place()  # lo sfondo segue la dimensione del testo
+        self.draw_layout()  # e il disegno delle Impostazioni le righe vere
 
 
 STARTUP_LNK = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs",
