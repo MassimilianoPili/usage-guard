@@ -784,6 +784,10 @@ def read_claude_cli(pc, blocked):
             r["windows"].append([label, int(m.group(2)), text_reset(m.group(3), m.group(4))])
         r["note"] = "usage_report senza limits, finestre lette dal testo di /usage" + (
             "" if all(w[2] for w in r["windows"]) else ": orario di reset non letto")
+    if not r["windows"]:
+        # Nessuna finestra non vale "tutto a 0": l'errore lascia nello state i numeri di prima
+        # (2026-10-24 21:28, poll "riuscito" a dati vuoti a 88%, a 3 punti dalla pausa)
+        raise PollError("nessuna finestra nell'output di /usage")
     extra_credits(rl.get("extra_usage") or {}, r)
     return r
 
@@ -1185,8 +1189,10 @@ def interval(name, pc, st):
     la pausa e' spenta) e non ancora bloccato: near_interval. A 1%/min, 120s piu' un /usage in
     timeout arrivavano alla soglia gia' 4-5 punti oltre (2026-10-18, pausa a 93% scattata a 96%);
     45s pero' sull'API danno 429 dopo ~17 minuti (2026-10-24), 300s mai: default 60.
-    Bloccato si torna all'intervallo normale: si aspetta solo il reset. near 0: mai veloce."""
-    if name != "claude" or st.get("blocked") == 1 or not pc.get("near"):
+    Bloccato si torna all'intervallo normale: si aspetta solo il reset. near 0: mai veloce.
+    In pausa dopo un 429 anche: claude -p legge la stessa /api/oauth/usage con lo stesso token, e
+    il poll veloce teneva il limite esaurito (2026-10-24, 22:00-23:11: 71 poll, 59 col 429)."""
+    if name != "claude" or st.get("blocked") == 1 or not pc.get("near") or to_int(st.get("api_backoff")) > now():
         return pc["interval"]
     skip = re.compile(pc["skip"], re.I) if pc.get("skip") else None
     top = max((w[1] for w in st.get("windows") or [] if not (skip and skip.search(w[0]))), default=0)

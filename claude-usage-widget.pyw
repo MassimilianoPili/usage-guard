@@ -788,7 +788,8 @@ class Widget:
                  "Oltre il limite si blocca solo a tetto extra raggiunto.\n"
                  "Pausa e continue passano dal messaging fra sessioni:\n"
                  "serve crossSessionInbound \"accept\" in settings.json.\n"
-                 "Poll veloce sotto i 60 s: l'API risponde 429 (a 45 s dopo ~17 minuti).")
+                 "Poll veloce sotto i 60 s: l'API risponde 429 (a 45 s dopo ~17 minuti).\n"
+                 "Dopo un 429 si torna all'intervallo normale: claude -p usa la stessa API.")
         elif name == "codex":
             entry("config.toml", "config")
             entry("codex.exe (vuoto: dall'estensione VS Code)", "binary")
