@@ -87,6 +87,7 @@ API_TIMEOUT = 15
 CODEX_TIMEOUT = 90  # l'app-server impiega ~20s solo a partire
 SEND_TIMEOUT = 180
 SPEND = "spesa"  # la finestra dei piani senza meter: la spesa del periodo, in % del tetto
+RESET_SLACK = 120  # stessa finestra: il reset del testo di /usage e' al minuto, quello dell'API no
 MONTHS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
                                       "Nov", "Dec"), 1)}  # il testo di /usage e' in inglese
 
@@ -1221,6 +1222,28 @@ def decide(name, pc, r):
     return False, "", 0
 
 
+def steady(prev, new):
+    """Dentro una finestra l'uso non scende: una lettura piu' bassa della precedente e' vecchia (uno
+    snapshot di claude -p, o un header di rate limit) e non vale come reset. Si accetta solo se e'
+    di una finestra dopo (reset piu' tardi di oltre RESET_SLACK) o se il reset precedente e' passato;
+    senza nessuno dei due reset non si sa, e si accetta. Il 2026-10-30 alle 13:46 il continue e'
+    partito su un 90% vecchio (reset 13:50, prima 92%, vero 94%).
+    Ritorna le finestre da usare e, per il log, quelle tenute."""
+    old = {w[0]: w for w in prev}
+    out, kept = [], []
+    for label, pct, reset in new:
+        p = old.get(label)
+        if p and pct < p[1] and (reset or p[2]):
+            later = reset and p[2] and reset > p[2] + RESET_SLACK
+            over = p[2] and now() >= p[2]
+            if not (later or over):
+                out.append(list(p))
+                kept.append(f"{label} {pct}% < {p[1]}%")
+                continue
+        out.append([label, pct, reset])
+    return out, ", ".join(kept)
+
+
 def interval(name, pc, st):
     """Secondi fra due poll. Claude a meno di near punti dalla soglia (la pausa, o il blocco se
     la pausa e' spenta) e non ancora bloccato: near_interval. A 1%/min, 120s piu' un /usage in
@@ -1300,6 +1323,10 @@ def _poll(name, pc, force):
         update_state(name, **fields)
         return
 
+    if name == "claude":
+        r["windows"], kept = steady(st.get("windows") or [], r["windows"])
+        if kept:
+            r["note"] = "; ".join(n for n in (r.get("note"), "lettura vecchia, tenuta la precedente: " + kept) if n)
     if r.get("note"):
         log(name, f"nota: {r['note']}")
     hit, reason, resets = decide(name, pc, r)
