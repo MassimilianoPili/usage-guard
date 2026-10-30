@@ -86,6 +86,7 @@ POLL_TIMEOUT = 120
 API_TIMEOUT = 15
 CODEX_TIMEOUT = 90  # l'app-server impiega ~20s solo a partire
 SEND_TIMEOUT = 180
+SPEND = "spesa"  # la finestra dei piani senza meter: la spesa del periodo, in % del tetto
 MONTHS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
                                       "Nov", "Dec"), 1)}  # il testo di /usage e' in inglese
 
@@ -704,16 +705,41 @@ def read_claude_api():
         raise PollError(f"risposta non JSON: {e}")
     if not isinstance(body, dict):
         raise PollError("risposta senza oggetto JSON")
-    r = {"windows": limit_windows(body.get("limits")), "note": ""}
-    if not r["windows"]:
-        raise PollError("risposta senza finestre in limits")
+    return usage_from_body(body)
+
+
+def usage_from_body(body):
+    """limits[] ed extra_usage come li dichiara lo schema di Claude Code (2.1.292): limits vuoto se
+    il server non ha meter (piani a sola spesa), null se la lettura e' fallita."""
+    limits = body.get("limits")
+    if not isinstance(limits, list):
+        raise PollError("risposta senza limits: lettura dell'uso fallita lato server")
     x = body.get("extra_usage") or {}
+    r = {"windows": limit_windows(limits), "note": ""}
     extra_credits(x, r)
-    # Il JSON non dice se si e' in overage: lo si deduce come il testo di /usage, una finestra al
-    # 100% con gli extra attivi. Dedotto: al 2026-10-24 mai vista una risposta in overage.
-    over = x.get("is_enabled") and any(w[1] >= 100 for w in r["windows"])
+    if not limits:
+        r["windows"] += spend_window(x, body.get("spend"))
+    if not r["windows"]:
+        raise PollError("risposta senza meter ne' spesa")
+    # Il JSON non dice se si e' in overage: lo si deduce come il testo di /usage, un meter al 100%
+    # con gli extra attivi. Dedotto: al 2026-10-24 mai vista una risposta in overage.
+    over = x.get("is_enabled") and any(w[1] >= 100 for w in r["windows"] if w[0] != SPEND)
     r["mode"] = "overages" if over else "subscription"
     return r
+
+
+def spend_window(x, spend=None):
+    """Piano senza meter: la spesa del periodo diventa la finestra SPEND, in % del tetto. Da
+    extra_usage, dichiarato ("overage spend for the billing period"), anche con is_enabled falso:
+    lo diventa proprio a tetto raggiunto. Se manca, dal blocco spend del body, che invece non e'
+    dichiarato da nessuna parte. Senza reset: il JSON non porta la data."""
+    lim = x.get("monthly_limit")
+    if isinstance(lim, (int, float)) and lim > 0:
+        pct = x["utilization"] if isinstance(x.get("utilization"), (int, float)) else (x.get("used_credits") or 0) / lim * 100
+        return [[SPEND, int(pct), 0]]
+    if isinstance((spend or {}).get("percent"), (int, float)):
+        return [[SPEND, int(spend["percent"]), 0]]
+    return []
 
 
 def limit_windows(limits):
@@ -730,8 +756,9 @@ def limit_windows(limits):
 
 
 def extra_credits(x, r):
-    """used_cents, currency e il testo credits da extra_usage, se attivi."""
-    if x.get("is_enabled") and isinstance(x.get("used_credits"), (int, float)):
+    """used_cents, currency e il testo credits da extra_usage, se attivi o con un tetto (a tetto
+    raggiunto is_enabled diventa falso, e la spesa serve proprio allora)."""
+    if (x.get("is_enabled") or x.get("monthly_limit")) and isinstance(x.get("used_credits"), (int, float)):
         used = round(x["used_credits"])
         lim = x["monthly_limit"] if isinstance(x.get("monthly_limit"), (int, float)) else 0
         pct = x["utilization"] if isinstance(x.get("utilization"), (int, float)) else (used / lim * 100 if lim > 0 else 0)
@@ -769,20 +796,25 @@ def read_claude_cli(pc, blocked):
         elif isinstance(c, list):
             text += "\n".join(b.get("text", "") for b in c if isinstance(b, dict)) + "\n"
         rep = o.get("usage_report") or rep
-    # Un output senza righe di usage non vale come 0%
-    if "You are currently using your" not in text:
+    # Un output senza righe di usage non vale come 0%. Il testo di un piano a sola spesa non lo
+    # conosciamo: vale anche l'usage_report, il suo "structured twin" dichiarato
+    if "You are currently using your" not in text and not (rep or {}).get("rate_limits"):
         raise PollError(f"nessun messaggio di /usage nell'output (rc={p.returncode})")
     r = {"windows": [], "mode": "overages" if "using your overages" in text else "subscription", "note": ""}
     rl = (rep or {}).get("rate_limits") or {}
     if isinstance(rl.get("limits"), list):
         r["windows"] = limit_windows(rl["limits"])
+        if not rl["limits"]:  # nessun meter: piano a sola spesa
+            r["windows"] += spend_window(rl.get("extra_usage") or {})
     else:
+        # limits null: per lo schema la lettura dell'API e' fallita (2026-10-24, nei 429), e il
+        # testo viene dagli header di rate limit o da uno snapshot del CLI.
         # "Current session: 91% used · resets Oct 24, 11:09pm (Europe/Rome)"
         for m in re.finditer(r"^Current ([^:]+): (\d+)% used(?:[^\n]*?resets ([^\n(]+?)\s*\(([^)\n]+)\))?",
                              text, re.M):
             label = re.sub(r"^week \((.*)\)$", r"week(\1)", m.group(1)).replace(" ", "")
             r["windows"].append([label, int(m.group(2)), text_reset(m.group(3), m.group(4))])
-        r["note"] = "usage_report senza limits, finestre lette dal testo di /usage" + (
+        r["note"] = "API non letta dal CLI, finestre dal testo di /usage (header o snapshot)" + (
             "" if all(w[2] for w in r["windows"]) else ": orario di reset non letto")
     if not r["windows"]:
         # Nessuna finestra non vale "tutto a 0": l'errore lascia nello state i numeri di prima
@@ -794,7 +826,7 @@ def read_claude_cli(pc, blocked):
 
 def text_reset(when, tz):
     """'Oct 24, 11:09pm' o '5pm', nel fuso tz, dal testo di /usage: epoch, 0 se non si legge.
-    Senza anno: quello corrente, o il prossimo se la data e' passata da piu' di un giorno."""
+    Senza anno: quello corrente, o il prossimo se la data e' passata da oltre sei mesi."""
     m = re.fullmatch(r"(?:([A-Za-z]{3}) (\d{1,2}),?\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)", (when or "").strip(), re.I)
     if not m or (m.group(1) and m.group(1).title() not in MONTHS):
         return 0
@@ -809,7 +841,9 @@ def text_reset(when, tz):
         dt = datetime(today.year, month, day, hour, int(m.group(4) or 0), tzinfo=zone)
         if not m.group(1) and dt.timestamp() <= now():
             dt += timedelta(days=1)  # solo l'ora, gia' passata: e' domani
-        elif dt.timestamp() < now() - 86400:
+        elif dt.timestamp() < now() - 180 * 86400:
+            # solo il cambio d'anno (dicembre letto a gennaio): una data passata da poco e' vera, il
+            # testo puo' venire da uno snapshot vecchio del CLI, e un reset passato va mostrato tale
             dt = dt.replace(year=dt.year + 1)
     except ValueError:
         return 0
@@ -1168,6 +1202,9 @@ def decide(name, pc, r):
     resets = max([w[2] for w in hit], default=0)
     if name != "claude":
         return bool(hit), reason, resets
+    if any(w[0] == SPEND for w in hit):
+        # piano a sola spesa: la finestra e' gia' il tetto, non c'e' un overage da pesare coi credits
+        return True, reason, resets
     if r["mode"] == "overages":
         # anche una finestra ignorata al 100% manda in overage: il suo reset serve
         reason += " overage attivo"
