@@ -148,6 +148,10 @@ K32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
 K32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
 K32.SetEvent.argtypes = [ctypes.c_void_p]
 K32.WaitForSingleObject.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+K32.OpenProcess.restype = ctypes.c_void_p
+K32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+K32.CloseHandle.argtypes = [ctypes.c_void_p]
+UPDATE_EVERY = 600  # s fra due controlli dal widget; in rete si va solo ogni update.interval_h ore
 
 
 def monitor_rect(x, y):
@@ -220,6 +224,9 @@ class Widget:
         self.rows, self.editing, self.edit_close = [], False, None
         self.layout_vars, self.layout_radios, self.dock_canvas, self.box_canvas = {}, [], None, None
         self.anchor, self.topleft = None, None  # punto fisso del box, o angolo da convertire
+        # aggiornamenti: il thread scrive solo questi campi, Tk li legge nel tick
+        self.update_tag, self.update_busy, self.update_last, self.restart_pending = None, False, 0, False
+        self.update_label, self.closed = None, False
         root = self.root = tk.Tk()
         top = self.top = tk.Toplevel(root)
         for win in (root, top):
@@ -236,6 +243,8 @@ class Widget:
         self.menu.add_command(label="Blocca", command=self.block_all)
         self.menu.add_command(label="Impostazioni...", command=self.settings)
         self.menu.add_command(label="Apri log", command=self.open_log)
+        self.menu.add_command(label="Aggiorna", command=self.update_now)
+        self.update_index = self.menu.index("end")
         self.autostart = tk.BooleanVar(value=os.path.isfile(STARTUP_LNK))
         self.menu.add_checkbutton(label="Avvia con Windows", variable=self.autostart, command=self.toggle_autostart)
         self.menu.add_separator()
@@ -356,6 +365,12 @@ class Widget:
         blocked = [self.state.get(n, {}).get("blocked") == 1 for n in on]
         self.menu.entryconfigure(1, state="normal" if any(blocked) else "disabled")
         self.menu.entryconfigure(2, state="normal" if not all(blocked) else "disabled")
+        tag = self.update_tag
+        label = ("Aggiornamento in corso..." if self.update_busy else
+                 f"Aggiorna a {tag}" if tag and ug.installed() else
+                 f"Aggiorna a {tag} (solo dalla copia installata)" if tag else "Aggiorna (nessuna versione nuova)")
+        self.menu.entryconfigure(self.update_index, label=label,
+                                 state="normal" if tag and ug.installed() and not self.update_busy else "disabled")
         self.autostart.set(os.path.isfile(STARTUP_LNK))  # il collegamento si puo' togliere anche a mano
         self.menu_open = True  # su Windows tk_popup torna a menu chiuso
         try:
@@ -430,6 +445,9 @@ class Widget:
             return
         if key == "source" and value not in ug.SOURCES:
             return
+        if name == "update" and (key == "mode" and value not in ug.UPDATE_MODES
+                                 or key == "interval_h" and not 1 <= value <= 720):
+            return
         was = pc.get(key)
         pc[key] = value
         if key == "enabled" and was and not value:
@@ -469,6 +487,7 @@ class Widget:
         self.widget_tab(nb)
         self.layout_tab(nb)
         tabs = {name: self.provider_tab(nb, name) for name in ug.PROVIDERS}
+        self.update_tab(nb)
         if first:
             nb.select(tabs["claude"])
 
@@ -547,6 +566,27 @@ class Widget:
         tk.Spinbox(box, from_=1, to=100, width=5, textvariable=pref(tk.IntVar, "warn")).grid(row=3, column=1, sticky="w")
         tk.Label(box, text="Rosso al 100% del limite di ciascun provider.",
                  fg="gray40").grid(row=4, column=0, columnspan=2, sticky="w")
+
+    def update_tab(self, nb):
+        box = tk.Frame(nb, padx=10, pady=6)
+        nb.add(box, text="Aggiornamenti")
+        u = self.cfg["update"]
+        tk.Label(box, text="Modalita'").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(box, values=ug.UPDATE_MODES, state="readonly", width=7,
+                     textvariable=self.bound(tk.StringVar, u["mode"],
+                                             lambda v: self.set_cfg("update", "mode", v))).grid(row=0, column=1, sticky="w")
+        tk.Label(box, text="Controllo ogni, ore").grid(row=1, column=0, sticky="w")
+        tk.Spinbox(box, from_=1, to=720, width=5,
+                   textvariable=self.bound(tk.IntVar, u["interval_h"],
+                                           lambda v: self.set_cfg("update", "interval_h", v))).grid(row=1, column=1, sticky="w")
+        tk.Button(box, text="Controlla ora", command=lambda: self.update_now(check_only=True)).grid(
+            row=2, column=0, sticky="w", pady=(4, 0))
+        self.update_label = tk.Label(box, text=self.update_text(), fg="gray40", justify="left")
+        self.update_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 4))
+        tk.Label(box, text="off: nessun controllo. notify: lo dice il widget, installi dal menu Aggiorna.\n"
+                           "auto: installa e riavvia, mai durante un blocco o una pausa.\n"
+                           "Si aggiorna solo la copia installata in %LOCALAPPDATA%\\usage-guard.",
+                 fg="gray40", justify="left").grid(row=4, column=0, columnspan=2, sticky="w")
 
     # --- scheda Posizione ------------------------------------------------------
     def layout_tab(self, nb):
@@ -863,12 +903,85 @@ class Widget:
             self.state_mtime = None
         threading.Thread(target=work, daemon=True).start()
 
+    # --- aggiornamenti ------------------------------------------------------------
+    def update_tick(self, now):
+        """Il controllo della versione nuova, in un thread; con auto anche l'installazione, che pero'
+        aspetta la fine di blocchi e pause: dopo, il widget si riavvia."""
+        mode = ug.update_config(self.cfg)["mode"]
+        if mode == "off":
+            self.update_tag = None
+            return
+        if self.update_busy or now - self.update_last < UPDATE_EVERY:
+            return
+        self.update_last, self.update_busy = now, True
+
+        def work():
+            try:
+                self.update_tag = ug.check_update()
+                if mode == "auto" and self.update_tag and ug.installed():
+                    busy = ug.update_busy()
+                    if busy:
+                        ug.log("update", f"{self.update_tag} rimandata: {busy}")
+                    else:
+                        ug.install_release(self.update_tag)
+                        self.restart_pending = True
+            except Exception as e:  # rete, zip, disco: si riprova al prossimo giro
+                self.cfg_err = f"aggiornamento: {e}"
+                ug.log("update", f"ERRORE {e}")
+            finally:
+                self.update_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def update_now(self, check_only=False):
+        """Dal menu installa la versione nuova; dalle Impostazioni (check_only) controlla subito."""
+        if self.update_busy:
+            return
+        self.update_busy, self.update_last = True, time.time()
+        tag = self.update_tag
+
+        def work():
+            try:
+                if check_only:
+                    self.update_tag = ug.check_update(force=True)
+                else:
+                    ug.install_release(tag)
+                    self.restart_pending = True
+            except Exception as e:
+                self.cfg_err = f"aggiornamento: {e}"
+                ug.log("update", f"ERRORE {e}")
+            finally:
+                self.update_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def restart(self):
+        """Nuovo widget dalla copia installata, che aspetta l'uscita di questo per prendere il mutex."""
+        ug.log("update", f"riavvio del widget su v{ug.__version__} installata")
+        ug.launch_widget(after=os.getpid())
+        self.closed = True  # il tick non si riprogramma su un Tk distrutto
+        self.root.destroy()
+
+    def update_text(self):
+        st = self.state.get("update", {})
+        checked = num(st.get("checked"))
+        parts = [f"v{ug.__version__}, " + ("copia installata" if ug.installed() else "copia di sviluppo"), ug.HERE,
+                 "ultimo controllo: " + (time.strftime("%d/%m %H:%M", time.localtime(checked)) if checked else "mai")
+                 + (f", ultima release {st['latest']}" if st.get("latest") else "")]
+        if st.get("err"):
+            parts.append(f"errore: {st['err']}")
+        return "\n".join(parts)
+
     def tick(self):
         # Il prossimo tick si programma comunque: un'eccezione qui congelava la riga
         # sull'ultimo valore, coi poll da menu che continuavano senza che si vedesse.
         try:
+            if self.restart_pending:
+                self.restart()
+                return
             self.reload()
             now = time.time()
+            self.update_tick(now)
+            if self.update_label and self.update_label.winfo_exists():
+                self.update_label.configure(text=self.update_text())
             for name in ug.PROVIDERS:
                 pc = self.cfg[name]
                 if not pc["enabled"] or name in self.running:
@@ -890,7 +1003,8 @@ class Widget:
             self.crash(type(e), e, e.__traceback__)
             self.shown = None  # al prossimo giro la riga mostra l'errore
         finally:
-            self.root.after(TICK_MS, self.tick)
+            if not self.closed:
+                self.root.after(TICK_MS, self.tick)
 
     # --- righe ----------------------------------------------------------------
     def row(self, name, now):
@@ -942,6 +1056,9 @@ class Widget:
                 blocked |= b
         if not rows:
             rows.append([("nessun provider attivo: tasto destro, Impostazioni", DIM, False)])
+        if self.update_tag:
+            rows.append([(f"aggiornamento {self.update_tag}: tasto destro, Aggiorna" if ug.installed() else
+                          f"{self.update_tag} disponibile: python usage_guard.py --install", WARN, False)])
         if self.cfg_err:
             rows.append([(self.cfg_err[:80], WARN, False)])
         if (blocked, rows) == self.shown:
@@ -996,7 +1113,17 @@ def single_instance():
     return mutex, show  # tenuti fino all'uscita
 
 
+def wait_exit(pid, timeout_ms=20000):
+    """Dopo un aggiornamento: aspetta l'uscita del widget vecchio, che tiene il mutex."""
+    h = K32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if h:
+        K32.WaitForSingleObject(h, timeout_ms)
+        K32.CloseHandle(h)
+
+
 if __name__ == "__main__":
+    if "--after" in sys.argv[1:-1]:
+        wait_exit(num(sys.argv[sys.argv.index("--after") + 1]))
     _mutex, _show = single_instance()
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)  # testo nitido sugli schermi scalati

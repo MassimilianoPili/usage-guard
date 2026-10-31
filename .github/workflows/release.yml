@@ -1,0 +1,34 @@
+# Sul tag vX.Y.Z: controlla che usage_guard.py dichiari la stessa versione, poi pubblica la
+# release con usage-guard.zip (i soli file che usage_guard.py --install accetta) e il suo sha256.
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versione del tag e di usage_guard.py
+        run: |
+          v=$(sed -nE 's/^__version__ = "([^"]+)".*/\1/p' usage_guard.py)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "Il tag e' $GITHUB_REF_NAME, usage_guard.py dichiara $v"; exit 1
+          fi
+
+      - name: Zip e sha256
+        run: |
+          zip -X usage-guard.zip usage_guard.py claude-usage-widget.pyw claude-usage-guard.sh
+          sha256sum usage-guard.zip | cut -d' ' -f1 > usage-guard.zip.sha256
+          unzip -l usage-guard.zip
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" usage-guard.zip usage-guard.zip.sha256 --title "$GITHUB_REF_NAME" --generate-notes

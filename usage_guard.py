@@ -33,6 +33,7 @@ prima di scrivere e torna identico allo sblocco.
 
 Uso: python usage_guard.py [--widget|--loop|--once|--status|--block|--unblock|--config|--help] [provider]
      python usage_guard.py --pause|--resume [sessione ...]
+     python usage_guard.py --version|--check-update|--install [vX.Y.Z]
 --block blocca a mano, anche sotto i limiti: il poll non lo toglie, resta fino a
 --unblock; allo sblocco le chat di Claude che lavoravano ricevono il continue.
 --pause e --resume mandano il messaggio a mano: senza nomi, la pausa va alle chat
@@ -41,6 +42,11 @@ Senza argomenti apre il widget (claude-usage-widget.pyw), che importa questo
 modulo e fa i poll in proprio. Widget e --loop possono girare insieme: chi
 trova un poll recente nello state salta il turno, e un lock per provider tiene
 un solo poll alla volta.
+Aggiornamenti dalle release di GitHub (zip + sha256, li pubblica il workflow sul tag):
+--install mette l'ultima, o quella indicata, in %LOCALAPPDATA%/usage-guard, la copia
+che gira e si aggiorna; la cartella di sviluppo non la tocca. In config, update.mode:
+off (default), notify (il widget lo dice) o auto (installa e riavvia il widget, mai
+durante un blocco o una pausa), con un controllo ogni update.interval_h ore.
 
 Config ~/.claude/usage-guard.json, state ~/.claude/usage-guard.state.json,
 log ~/.claude/usage-guard.log.
@@ -49,6 +55,7 @@ import contextlib
 import ctypes
 import ctypes.wintypes as wintypes
 import glob
+import hashlib
 import json
 import os
 import queue
@@ -63,7 +70,9 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime, timedelta
+from io import BytesIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
@@ -71,7 +80,9 @@ try:
 except ImportError:
     truststore = None
 
-HERE =os.path.dirname(os.path.abspath(__file__))
+__version__ = "1.0.0"  # lo aggiorna release.ps1; il workflow di release controlla che combaci col tag
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 DIR = os.path.join(os.path.expanduser("~"), ".claude")
 CONF = os.path.join(DIR, "usage-guard.json")
 STATE = os.path.join(DIR, "usage-guard.state.json")
@@ -81,6 +92,15 @@ LEGACY_CONF = os.path.join(DIR, "usage-guard.conf")    # versione bash
 LEGACY_STATE = os.path.join(DIR, "usage-guard.state")  # versione bash
 SESSIONS = os.path.join(DIR, "sessions")  # un <pid>.json per sessione di Claude Code
 CREDENTIALS = os.path.join(DIR, ".credentials.json")  # token OAuth di Claude Code, solo letto
+# La copia installata, quella che si aggiorna da sola; la cartella di sviluppo non si tocca mai
+INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local"),
+                           "usage-guard")
+REPO = "MassimilianoPili/usage-guard"
+RELEASES = f"https://github.com/{REPO}/releases"
+ASSET = "usage-guard.zip"  # col suo usage-guard.zip.sha256, li pubblica il workflow sul tag
+PAYLOAD = ("usage_guard.py", "claude-usage-widget.pyw", "claude-usage-guard.sh")  # tutto e solo il contenuto dello zip
+UPDATE_MODES = ("off", "notify", "auto")
+UPDATE_TIMEOUT = 30
 LOG_MAX = 1 << 20
 POLL_TIMEOUT = 120
 API_TIMEOUT = 15
@@ -117,6 +137,8 @@ PROVIDERS = ("claude", "codex", "copilot")
 NAMES = {"claude": "Claude", "codex": "Codex", "copilot": "Copilot"}
 DEFAULTS = {
     "setup_done": False,  # falso: il widget chiede quali provider attivare
+    # off: nessun controllo; notify: il widget dice che c'e' una versione nuova; auto: la installa
+    "update": {"mode": "off", "interval_h": 24},
     "claude": {"enabled": True, "block": True, "limit": 100, "interval": 120,
                "extra_limit": 0, "currency": "", "skip": "",
                "settings": "~/.claude/settings.json", "source": "auto",
@@ -317,8 +339,8 @@ def load_config():
     except ValueError as e:
         raise PollError(f"configurazione illeggibile ({CONF}): {e}")
     for key, value in saved.items():
-        if key in PROVIDERS and isinstance(value, dict):
-            cfg[key].update(value)
+        if isinstance(cfg.get(key), dict) and isinstance(value, dict):
+            cfg[key].update(value)  # provider e update: le chiavi nuove prendono il default
         elif key in cfg:
             cfg[key] = value
     return cfg
@@ -1451,20 +1473,170 @@ def _unblock(name, pc, why):
     return ok
 
 
+# --- aggiornamenti ---------------------------------------------------------------
+def parse_version(tag):
+    """'v1.2.3' o '1.2.3' -> (1, 2, 3); None se non e' una versione."""
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(tag or "").strip())
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def newer(tag):
+    v = parse_version(tag)
+    return bool(v) and v > parse_version(__version__)
+
+
+def update_config(cfg=None):
+    """La sezione update della config, coi valori fuori range riportati al default."""
+    u = dict(DEFAULTS["update"], **((cfg or load_config()).get("update") or {}))
+    if u["mode"] not in UPDATE_MODES:
+        u["mode"] = DEFAULTS["update"]["mode"]
+    if not (isinstance(u["interval_h"], int) and 1 <= u["interval_h"] <= 720):
+        u["interval_h"] = DEFAULTS["update"]["interval_h"]
+    return u
+
+
+def installed():
+    """Vero se gira la copia installata, l'unica che si aggiorna da sola."""
+    return os.path.normcase(os.path.abspath(HERE)) == os.path.normcase(os.path.abspath(INSTALL_DIR))
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # il redirect lo si legge, non lo si segue
+
+
+def latest_tag():
+    """Tag dell'ultima release, dal redirect di /releases/latest. Niente API di GitHub: senza token
+    concede 60 richieste l'ora per IP, condivise con chi sta dietro lo stesso NAT aziendale."""
+    opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=tls_context()))
+    req = urllib.request.Request(RELEASES + "/latest", method="HEAD",
+                                 headers={"User-Agent": f"usage-guard/{__version__}"})
+    try:
+        with opener.open(req, timeout=UPDATE_TIMEOUT) as resp:
+            location = resp.headers.get("Location") or resp.geturl()
+    except urllib.error.HTTPError as e:
+        if e.code not in (301, 302, 303, 307, 308):
+            raise PollError({404: "release non trovate: repo privato o senza release"}.get(e.code, f"HTTP {e.code}"))
+        location = e.headers.get("Location") or ""
+    except (urllib.error.URLError, OSError) as e:
+        raise PollError(f"GitHub non raggiungibile: {getattr(e, 'reason', e)}")
+    tag = location.rstrip("/").rsplit("/", 1)[-1]
+    if "/releases/tag/" not in location or not parse_version(tag):
+        raise PollError("nessuna release pubblicata")
+    return tag
+
+
+def check_update(force=False):
+    """Il tag della release se piu' nuovo della versione in esecuzione, altrimenti None. In rete al
+    massimo ogni interval_h ore (force: subito); fra un controllo e l'altro vale l'ultimo letto.
+    In state, sezione update: checked, latest, err."""
+    u = update_config()
+    st = load_state().get("update", {})
+    if not force and (u["mode"] == "off" or now() - to_int(st.get("checked")) < u["interval_h"] * 3600):
+        return st.get("latest") if u["mode"] != "off" and newer(st.get("latest")) else None
+    try:
+        tag = latest_tag()
+    except PollError as e:
+        update_state("update", checked=now(), err=str(e))
+        log("update", f"ERRORE controllo: {e}")
+        return None
+    update_state("update", checked=now(), latest=tag, err="")
+    if not newer(tag):
+        return None
+    if st.get("latest") != tag:
+        log("update", f"disponibile {tag}, in uso v{__version__}")
+    return tag
+
+
+def update_busy():
+    """Il motivo per non aggiornare adesso, o "": un aggiornamento riavvia il widget."""
+    st = load_state()
+    if any(st.get(n, {}).get("blocked") == 1 for n in PROVIDERS):
+        return "blocco in corso"
+    if st.get("claude", {}).get("pause_reason"):
+        return "pausa in corso"
+    return ""
+
+
+def fetch(url):
+    """Un asset della release (GitHub rimanda al suo storage: il redirect qui si segue)."""
+    req = urllib.request.Request(url, headers={"User-Agent": f"usage-guard/{__version__}"})
+    try:
+        with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT, context=tls_context()) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        raise PollError(f"download di {url.rsplit('/', 1)[-1]}: HTTP {e.code}")
+    except (urllib.error.URLError, OSError) as e:
+        raise PollError(f"download di {url.rsplit('/', 1)[-1]}: {getattr(e, 'reason', e)}")
+
+
+def unpack(data, tag):
+    """I file di PAYLOAD dallo zip, in memoria. Rifiuta uno zip con file in piu' o in meno (cosi'
+    nessun percorso arriva al disco) e uno usage_guard.py che non dichiara la versione del tag."""
+    try:
+        z = zipfile.ZipFile(BytesIO(data))
+        names = sorted(n for n in z.namelist() if not n.endswith("/"))
+        if names != sorted(PAYLOAD):
+            raise PollError(f"zip di {tag} con file inattesi: {', '.join(names)}")
+        files = {n: z.read(n) for n in PAYLOAD}
+    except (zipfile.BadZipFile, OSError) as e:
+        raise PollError(f"zip di {tag} illeggibile: {e}")
+    m = re.search(rb'^__version__ = "([^"]+)"', files["usage_guard.py"], re.M)
+    declared = m.group(1).decode("ascii", "replace") if m else "nessuna"
+    if "v" + declared != tag:
+        raise PollError(f"lo zip di {tag} dichiara la versione {declared}")
+    return files
+
+
+def install_release(tag, target=INSTALL_DIR):
+    """Scarica lo zip di tag, lo verifica (sha256, contenuto, versione) e lo scrive in target; i file
+    di prima restano in target/previous. Una cartella con .git e' di sviluppo e non si tocca."""
+    if os.path.exists(os.path.join(target, ".git")):
+        raise PollError(f"{target} e' una copia di sviluppo (ha .git): non la aggiorno")
+    data = fetch(f"{RELEASES}/download/{tag}/{ASSET}")
+    want = (fetch(f"{RELEASES}/download/{tag}/{ASSET}.sha256").decode("ascii", "replace").split() or [""])[0].lower()
+    got = hashlib.sha256(data).hexdigest()
+    if got != want:
+        raise PollError(f"sha256 dello zip di {tag} non combacia: {got[:12]}..., atteso {want[:12]}...")
+    files = unpack(data, tag)
+    prev = os.path.join(target, "previous")
+    os.makedirs(prev, exist_ok=True)
+    for name in PAYLOAD:
+        if os.path.isfile(os.path.join(target, name)):
+            shutil.copy2(os.path.join(target, name), os.path.join(prev, name))
+    for name, body in files.items():
+        tmp = os.path.join(target, name + ".usage-guard.tmp")
+        with open(tmp, "wb") as f:
+            f.write(body)
+        for _ in range(20):  # come write_atomic: un lettore col file aperto blocca il rename
+            try:
+                os.replace(tmp, os.path.join(target, name))
+                break
+            except PermissionError:
+                time.sleep(0.05)
+        else:
+            os.replace(tmp, os.path.join(target, name))
+    log("update", f"installata {tag} in {target}, la versione di prima in {prev}")
+
+
 # --- modi ----------------------------------------------------------------------
-def launch_widget():
+def launch_widget(after=None):
+    """Il widget di questa copia. after: il pid di un widget che sta uscendo (riavvio dopo un
+    aggiornamento), che il nuovo aspetta prima di prendere il mutex dell'istanza unica."""
     pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     widget = os.path.join(HERE, "claude-usage-widget.pyw")
     if not os.path.isfile(widget):
         raise SystemExit(f"Errore: widget non trovato: {widget}")
+    cmd = [pyw, widget] + (["--after", str(after)] if after else [])
     # Staccato dalla console e dal job del terminale: sopravvive alla sua chiusura
     flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     io = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     try:
-        subprocess.Popen([pyw, widget], creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, **io)
+        subprocess.Popen(cmd, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, **io)
     except OSError:
-        subprocess.Popen([pyw, widget], creationflags=flags, **io)
-    print("Widget avviato: menu e Impostazioni col tasto destro. Se era gia' aperto resta quello.")
+        subprocess.Popen(cmd, creationflags=flags, **io)
+    if not after:
+        print("Widget avviato: menu e Impostazioni col tasto destro. Se era gia' aperto resta quello.")
 
 
 def show_status(only):
@@ -1556,11 +1728,36 @@ def loop(only):
         time.sleep(min(max(5, min(due, default=60)), 300))
 
 
+def update_cli(mode, args):
+    where = "copia installata" if installed() else "copia di sviluppo"
+    if mode == "--version":
+        print(f"usage-guard v{__version__} ({where}: {HERE})\ninstallazione: {INSTALL_DIR}\n"
+              f"aggiornamenti: {update_config()['mode']}")
+        return 0
+    if mode == "--check-update":
+        tag = check_update(force=True)
+        err = load_state().get("update", {}).get("err")
+        print(f"in uso v{__version__}: " + (f"errore, {err}" if err else f"disponibile {tag}" if tag else "aggiornata"))
+        return 1 if err else 0
+    # --install [vX.Y.Z]: la release scelta, o l'ultima, nella cartella d'installazione
+    tag = args[0] if args else latest_tag()
+    if not parse_version(tag):
+        raise SystemExit(f"Versione non valida: {tag}. Esempio: v1.0.0")
+    tag = "v" + ".".join(map(str, parse_version(tag)))
+    install_release(tag)
+    print(f"Installata {tag} in {INSTALL_DIR}. Avvio: python \"{os.path.join(INSTALL_DIR, 'usage_guard.py')}\"; "
+          "se il widget e' gia' aperto, riavvialo dal suo menu (Chiudi, poi di nuovo).")
+    return 0
+
+
 def main(argv):
     mode = argv[0] if argv else "--widget"
     if mode in ("--pause", "--resume"):  # dopo l'opzione, nomi di sessione e non provider
         os.makedirs(DIR, exist_ok=True)
         return manual(mode == "--pause", argv[1:])
+    if mode in ("--version", "--check-update", "--install"):
+        os.makedirs(DIR, exist_ok=True)
+        return update_cli(mode, argv[1:])
     only = [p for p in argv[1:] if p in PROVIDERS] or list(PROVIDERS)
     if any(p not in PROVIDERS for p in argv[1:]):
         raise SystemExit(f"Provider sconosciuto. Validi: {', '.join(PROVIDERS)}")
