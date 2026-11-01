@@ -187,9 +187,15 @@ def stamp():
 
 
 def log(name, msg):
+    """Non solleva mai per la console: un'eccezione qui interrompeva chi logga a meta' del lavoro.
+    Il widget riavviato da un aggiornamento ha uno stdout cp1252, e la freccia nelle risposte di
+    SendMessage lo faceva cadere dopo l'invio e prima del registro (2026-11-01, 17:37)."""
     line = f"{stamp()} {name}: {msg}"
-    if sys.stdout:  # pythonw non ha stdout
-        print(line, flush=True)
+    if sys.stdout:  # pythonw lanciato senza console non ha stdout
+        try:
+            print(line, flush=True)
+        except (UnicodeError, OSError, ValueError):
+            pass  # vale il file, scritto in utf-8
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
@@ -1068,15 +1074,19 @@ def local_sessions(kinds=("interactive",)):
 
 
 def merge(reg, more):
-    known = {(s["pid"], s["procStart"]) for s in reg}
-    return reg + [s for s in more if (s["pid"], s["procStart"]) not in known]
+    """Una voce per conversazione: una sessione riaperta (processo nuovo, stesso sessionId, nome spesso
+    diverso) prende il posto della sua voce vecchia."""
+    new = {skey(s): s for s in more}
+    return [s for s in reg if skey(s) not in new] + list(new.values())
 
 
 def split_live(reg):
-    """Le sessioni registrate ancora vive (stesso processo) e quelle chiuse nel frattempo."""
-    live = {(s["pid"], s["procStart"]): s for s in local_sessions()}
-    key = lambda s: (s["pid"], s["procStart"])  # noqa: E731
-    return [live[key(s)] for s in reg if key(s) in live], [s for s in reg if key(s) not in live]
+    """Le conversazioni del registro ancora aperte, col processo e il nome di adesso, e quelle chiuse.
+    Per processo, una sessione riaperta valeva come chiusa e restava senza continue (2026-11-01:
+    6 in pausa alle 13:31, riaperte fra le 14:14 e le 14:45, nessun continue alle 14:42)."""
+    live = {skey(s): s for s in local_sessions()}
+    back = {skey(s): live[skey(s)] for s in reg if skey(s) in live}
+    return list(back.values()), [s for s in reg if skey(s) not in live]
 
 
 def pause_text(pc, reason, resets):
@@ -1160,8 +1170,9 @@ def ids(to):
 
 
 def skey(s):
-    """Una sessione e' il suo processo: il nome puo' ripetersi o cambiare, il pid puo' essere riusato."""
-    return s.get("pid"), s.get("procStart")
+    """Una sessione e' la sua conversazione (sessionId): sopravvive al riavvio del processo, mentre
+    pid e nome cambiano. Senza sessionId, il processo."""
+    return s.get("sessionId") or f"{s.get('pid')}:{s.get('procStart')}"
 
 
 def session_rule(pc, s):
@@ -1216,8 +1227,7 @@ def message(pause, sessions):
     else:
         text, kind = CONTINUE_TEXT, "ripresa dalla scheda"
     results = send(pc, sessions, text)
-    for name, res in results:
-        log("claude", f"{kind} -> {name}: {res[:160]}")
+    # prima il registro, poi il log: l'invio e' gia' avvenuto, e il registro e' cio' che lo ricorda
     if pause:
         edit_registry(lambda reg: merge(reg, sessions))
     else:
@@ -1225,6 +1235,8 @@ def message(pause, sessions):
         ok = [n for n, res in results if not res.startswith("ERRORE")]
         done = {skey(s) for s in sessions if any(n == s["name"] or n.startswith(s["name"] + " ") for n in ok)}
         edit_registry(lambda reg: [s for s in reg if skey(s) not in done])
+    for name, res in results:
+        log("claude", f"{kind} -> {name}: {res[:160]}")
     return results
 
 
