@@ -84,7 +84,7 @@ try:
 except ImportError:
     truststore = None
 
-__version__ = "1.1.0"  # lo aggiorna release.ps1; il workflow di release controlla che combaci col tag
+__version__ = "1.1.1"  # lo aggiorna release.ps1; il workflow di release controlla che combaci col tag
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIR = os.path.join(os.path.expanduser("~"), ".claude")
