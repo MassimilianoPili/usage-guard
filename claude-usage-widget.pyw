@@ -226,7 +226,7 @@ class Widget:
         self.anchor, self.topleft = None, None  # punto fisso del box, o angolo da convertire
         # aggiornamenti: il thread scrive solo questi campi, Tk li legge nel tick
         self.update_tag, self.update_busy, self.update_last, self.restart_pending = None, False, 0, False
-        self.update_label, self.closed = None, False
+        self.update_label, self.update_button, self.installed_tag, self.closed = None, None, None, False
         # scheda Sessioni: il thread d'invio scrive solo sess_msg e sess_busy
         self.sess_list, self.sess_shown, self.sess_sel, self.sess_by_key = None, None, set(), {}
         self.sess_msg, self.sess_busy, self.sess_buttons, self.sess_result = "", False, [], None
@@ -368,12 +368,8 @@ class Widget:
         blocked = [self.state.get(n, {}).get("blocked") == 1 for n in on]
         self.menu.entryconfigure(1, state="normal" if any(blocked) else "disabled")
         self.menu.entryconfigure(2, state="normal" if not all(blocked) else "disabled")
-        tag = self.update_tag
-        label = ("Aggiornamento in corso..." if self.update_busy else
-                 f"Aggiorna a {tag}" if tag and ug.installed() else
-                 f"Aggiorna a {tag} (solo dalla copia installata)" if tag else "Aggiorna (nessuna versione nuova)")
-        self.menu.entryconfigure(self.update_index, label=label,
-                                 state="normal" if tag and ug.installed() and not self.update_busy else "disabled")
+        label, ok = self.update_action()
+        self.menu.entryconfigure(self.update_index, label=label, state="normal" if ok else "disabled")
         self.autostart.set(os.path.isfile(STARTUP_LNK))  # il collegamento si puo' togliere anche a mano
         self.menu_open = True  # su Windows tk_popup torna a menu chiuso
         try:
@@ -710,11 +706,16 @@ class Widget:
         tk.Spinbox(box, from_=1, to=720, width=5,
                    textvariable=self.bound(tk.IntVar, u["interval_h"],
                                            lambda v: self.set_cfg("update", "interval_h", v))).grid(row=1, column=1, sticky="w")
-        tk.Button(box, text="Controlla ora", command=lambda: self.update_now(check_only=True)).grid(
-            row=2, column=0, sticky="w", pady=(4, 0))
+        buttons = tk.Frame(box)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        tk.Button(buttons, text="Controlla ora", command=lambda: self.update_now(check_only=True)).pack(side="left")
+        label, ok = self.update_action()
+        self.update_button = tk.Button(buttons, text=label, command=self.update_now,
+                                       state="normal" if ok else "disabled")
+        self.update_button.pack(side="left", padx=(6, 0))
         self.update_label = tk.Label(box, text=self.update_text(), fg="gray40", justify="left")
         self.update_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 4))
-        tk.Label(box, text="off: nessun controllo. notify: lo dice il widget, installi dal menu Aggiorna.\n"
+        tk.Label(box, text="off: nessun controllo. notify: lo dice il widget, installi col pulsante qui sopra o dal menu.\n"
                            "auto: installa e riavvia, mai durante un blocco o una pausa.\n"
                            "Si aggiorna solo la copia installata in %LOCALAPPDATA%\\usage-guard.",
                  fg="gray40", justify="left").grid(row=4, column=0, columnspan=2, sticky="w")
@@ -1055,13 +1056,24 @@ class Widget:
                         ug.log("update", f"{self.update_tag} rimandata: {busy}")
                     else:
                         ug.install_release(self.update_tag)
-                        self.restart_pending = True
+                        self.installed_tag, self.restart_pending = self.update_tag, True
             except Exception as e:  # rete, zip, disco: si riprova al prossimo giro
                 self.cfg_err = f"aggiornamento: {e}"
                 ug.log("update", f"ERRORE {e}")
             finally:
                 self.update_busy = False
         threading.Thread(target=work, daemon=True).start()
+
+    def update_action(self):
+        """Testo e disponibilita' di Aggiorna, uguali nel menu e nella scheda Aggiornamenti."""
+        tag = self.update_tag
+        if self.update_busy:
+            return "Aggiornamento in corso...", False
+        if not tag:
+            return "Aggiorna (nessuna versione nuova)", False
+        if not ug.installed():
+            return f"Aggiorna a {tag} (solo dalla copia installata)", False
+        return f"Aggiorna a {tag}", True
 
     def update_now(self, check_only=False):
         """Dal menu installa la versione nuova; dalle Impostazioni (check_only) controlla subito."""
@@ -1076,7 +1088,7 @@ class Widget:
                     self.update_tag = ug.check_update(force=True)
                 else:
                     ug.install_release(tag)
-                    self.restart_pending = True
+                    self.installed_tag, self.restart_pending = tag, True
             except Exception as e:
                 self.cfg_err = f"aggiornamento: {e}"
                 ug.log("update", f"ERRORE {e}")
@@ -1086,7 +1098,13 @@ class Widget:
 
     def restart(self):
         """Nuovo widget dalla copia installata, che aspetta l'uscita di questo per prendere il mutex."""
-        ug.log("update", f"riavvio del widget su v{ug.__version__} installata")
+        # i salvataggi in coda (500 ms dopo l'ultima modifica) si scrivono adesso: dopo destroy sparirebbero
+        for job, flush in ((self.cfg_job, self.save_cfg), (self.save_job, self.save_prefs)):
+            if job:
+                self.root.after_cancel(job)
+                flush()
+        # il modulo in memoria e' ancora quello vecchio: la versione e' quella appena installata
+        ug.log("update", f"riavvio del widget: da v{ug.__version__} a {self.installed_tag or 'la copia installata'}")
         ug.launch_widget(after=os.getpid())
         self.closed = True  # il tick non si riprogramma su un Tk distrutto
         self.root.destroy()
@@ -1113,6 +1131,8 @@ class Widget:
             self.update_tick(now)
             if self.update_label and self.update_label.winfo_exists():
                 self.update_label.configure(text=self.update_text())
+                label, ok = self.update_action()  # il controllo e' in un thread: il pulsante segue al tick
+                self.update_button.configure(text=label, state="normal" if ok else "disabled")
             self.draw_sessions()
             for name in ug.PROVIDERS:
                 pc = self.cfg[name]
