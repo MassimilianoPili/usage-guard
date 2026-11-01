@@ -227,6 +227,9 @@ class Widget:
         # aggiornamenti: il thread scrive solo questi campi, Tk li legge nel tick
         self.update_tag, self.update_busy, self.update_last, self.restart_pending = None, False, 0, False
         self.update_label, self.closed = None, False
+        # scheda Sessioni: il thread d'invio scrive solo sess_msg e sess_busy
+        self.sess_list, self.sess_shown, self.sess_sel, self.sess_by_key = None, None, set(), {}
+        self.sess_msg, self.sess_busy, self.sess_buttons, self.sess_result = "", False, [], None
         root = self.root = tk.Tk()
         top = self.top = tk.Toplevel(root)
         for win in (root, top):
@@ -445,6 +448,11 @@ class Widget:
             return
         if key == "source" and value not in ug.SOURCES:
             return
+        if key in ("pause_include", "pause_exclude", "skip"):
+            try:
+                re.compile(value)
+            except re.error:
+                return  # regex scritta a meta': si salva quando e' valida
         if name == "update" and (key == "mode" and value not in ug.UPDATE_MODES
                                  or key == "interval_h" and not 1 <= value <= 720):
             return
@@ -471,8 +479,8 @@ class Widget:
             self.win.lift()
             return
         w = self.win = tk.Toplevel(self.root)
-        # i disegni e il campo aperti erano della finestra chiusa
-        self.dock_canvas = self.box_canvas = self.edit_close = None
+        # i disegni, il campo aperto e la tabella delle sessioni erano della finestra chiusa
+        self.dock_canvas = self.box_canvas = self.edit_close = self.sess_list = None
         self.editing = False
         w.withdraw()  # si mostra dopo, gia' al suo posto
         w.title("usage guard")
@@ -487,6 +495,7 @@ class Widget:
         self.widget_tab(nb)
         self.layout_tab(nb)
         tabs = {name: self.provider_tab(nb, name) for name in ug.PROVIDERS}
+        nb.insert(tabs["codex"], self.sessions_tab(nb))  # subito dopo Claude
         self.update_tab(nb)
         if first:
             nb.select(tabs["claude"])
@@ -566,6 +575,128 @@ class Widget:
         tk.Spinbox(box, from_=1, to=100, width=5, textvariable=pref(tk.IntVar, "warn")).grid(row=3, column=1, sticky="w")
         tk.Label(box, text="Rosso al 100% del limite di ciascun provider.",
                  fg="gray40").grid(row=4, column=0, columnspan=2, sticky="w")
+
+    # --- scheda Sessioni ---------------------------------------------------------
+    def sessions_tab(self, nb):
+        """Le sessioni di Claude Code aperte: chi e' nel registro (avra' il continue al reset), le
+        regole sempre/mai, e i pulsanti per mandare pausa e continue a mano alle spuntate."""
+        tab = tk.Frame(nb, padx=8, pady=6)
+        nb.add(tab, text="Sessioni")
+        self.sess_list = tk.Frame(tab)
+        self.sess_list.grid(row=0, column=0, sticky="w")
+        self.sess_shown = None
+        # all'apertura sono spuntate quelle nel registro: durante una pausa il continue e' a un clic
+        self.sess_sel = {ug.skey(s) for s in self.state.get("claude", {}).get("paused_sessions") or []}
+        bar = tk.Frame(tab)
+        bar.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.sess_buttons = []
+        for text, cmd in (("Manda pausa", lambda: self.sess_send(True)), ("Manda continue", lambda: self.sess_send(False)),
+                          ("Aggiungi al registro", lambda: self.sess_register(True)),
+                          ("Togli dal registro", lambda: self.sess_register(False))):
+            b = tk.Button(bar, text=text, command=cmd)
+            b.pack(side="left", padx=(0, 6))
+            self.sess_buttons.append(b)
+        self.sess_result = tk.Label(tab, text=self.sess_msg, fg="gray40", justify="left", wraplength=620)
+        self.sess_result.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        rules = tk.LabelFrame(tab, text="Regole per pausa e continue automatici", padx=8, pady=4)
+        rules.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        pc = self.cfg["claude"]
+        for row, (key, text) in enumerate((("pause_include", "Sempre, anche se idle (regex)"),
+                                           ("pause_exclude", "Mai in pausa (regex)"))):
+            tk.Label(rules, text=text).grid(row=row, column=0, sticky="w")
+            tk.Entry(rules, width=48, textvariable=self.bound(
+                tk.StringVar, pc.get(key) or "", lambda v, key=key: self.set_cfg("claude", key, v))).grid(
+                row=row, column=1, sticky="w")
+        tk.Label(rules, text="Su nome o cartella, maiuscole indifferenti; Mai vince su Sempre. Es. Orchestr|framework-agentico\n"
+                             "Le regole valgono per i messaggi automatici; i pulsanti mandano alle spuntate, sempre.\n"
+                             "Aggiungi durante una pausa manda anche la pausa; fuori da una pausa registra e basta.",
+                 fg="gray40", justify="left").grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.draw_sessions()
+        return tab
+
+    def draw_sessions(self):
+        """La tabella delle sessioni vive, rifatta solo quando cambia qualcosa (ogni tick, 2 s)."""
+        if not (self.sess_list and self.win and self.win.winfo_exists() and self.sess_list.winfo_exists()):
+            return
+        if self.sess_result and self.sess_result.winfo_exists():
+            self.sess_result.configure(text=self.sess_msg)
+            for b in self.sess_buttons:
+                b.configure(state="disabled" if self.sess_busy else "normal")
+        sessions = sorted(ug.local_sessions(), key=lambda s: (str(s.get("cwd") or "").lower(), str(s.get("name") or "")))
+        reg = {ug.skey(s) for s in self.state.get("claude", {}).get("paused_sessions") or []}
+        pc = self.cfg["claude"]
+        self.sess_by_key = {ug.skey(s): s for s in sessions}
+        rows = [(ug.skey(s), s.get("name") or "?", os.path.basename(str(s.get("cwd") or "").rstrip("\\/")),
+                 s.get("status") or "?", ug.skey(s) in reg, ug.session_rule(pc, s), num(s.get("startedAt")) // 1000)
+                for s in sessions]
+        self.sess_sel &= set(self.sess_by_key) | reg  # le chiuse escono dalla selezione
+        if rows == self.sess_shown:
+            return
+        self.sess_shown = rows
+        for w in self.sess_list.winfo_children():
+            w.destroy()
+        for col, text in enumerate(("Sessione", "Cartella", "Stato", "Registro", "Regola", "Aperta")):
+            tk.Label(self.sess_list, text=text, font=("Segoe UI", 9, "bold")).grid(row=0, column=col, sticky="w", padx=(0, 10))
+        if not rows:
+            tk.Label(self.sess_list, text="Nessuna sessione di Claude Code aperta.", fg="gray40").grid(
+                row=1, column=0, columnspan=6, sticky="w")
+        for i, (k, name, folder, status, in_reg, rule, started) in enumerate(rows, 1):
+            def toggle(on, k=k):
+                (self.sess_sel.add if on else self.sess_sel.discard)(k)
+            tk.Checkbutton(self.sess_list, text=name, anchor="w",
+                           variable=self.bound(tk.BooleanVar, k in self.sess_sel, toggle)).grid(row=i, column=0, sticky="w")
+            tk.Label(self.sess_list, text=folder, fg="gray30").grid(row=i, column=1, sticky="w", padx=(0, 10))
+            working = status in ug.WORKING
+            tk.Label(self.sess_list, text="al lavoro" if working else status,
+                     fg="dark green" if working else "gray40").grid(row=i, column=2, sticky="w", padx=(0, 10))
+            tk.Label(self.sess_list, text="si'" if in_reg else "", fg="dark orange").grid(row=i, column=3, sticky="w")
+            tk.Label(self.sess_list, text=rule, fg="firebrick" if rule == "mai" else "navy").grid(row=i, column=4, sticky="w")
+            tk.Label(self.sess_list, text=time.strftime("%d/%m %H:%M", time.localtime(started)) if started else "",
+                     fg="gray40").grid(row=i, column=5, sticky="w")
+
+    def sess_targets(self):
+        return [self.sess_by_key[k] for k in self.sess_sel if k in self.sess_by_key]
+
+    def sess_send(self, pause):
+        to = self.sess_targets()
+        kind = "pausa" if pause else "continue"
+        if self.sess_busy:
+            return
+        if not to:
+            self.sess_msg = "Nessuna sessione spuntata."
+            return
+        self.sess_busy = True
+        self.sess_msg = f"{time.strftime('%H:%M')} invio {kind} a {len(to)} chat (claude -p, fino a qualche minuto)..."
+
+        def work():
+            try:
+                res = ug.message(pause, to)
+                self.sess_msg = f"{time.strftime('%H:%M')} {kind}: " + "; ".join(
+                    f"{n}: {'ERRORE ' + r[7:80] if r.startswith('ERRORE') else 'ok'}" for n, r in res)
+            except Exception as e:  # claude assente, timeout, nessun SendMessage: si vede e si riprova
+                self.sess_msg = f"{time.strftime('%H:%M')} {kind} non inviato: {e}"
+                ug.log("claude", f"ERRORE {kind} dalla scheda: {e}")
+            finally:
+                self.sess_busy, self.state_mtime = False, None  # il registro e' cambiato: si rilegge
+        threading.Thread(target=work, daemon=True).start()
+
+    def sess_register(self, add):
+        to = self.sess_targets()
+        if self.sess_busy:
+            return
+        if not to:
+            self.sess_msg = "Nessuna sessione spuntata."
+            return
+        if add and self.state.get("claude", {}).get("pause_reason"):
+            self.sess_send(True)  # pausa in corso: chi entra adesso riceve anche la pausa
+            return
+        try:
+            ug.register(to, add)
+            self.sess_msg = (f"{time.strftime('%H:%M')} " + ("aggiunte al" if add else "tolte dal")
+                             + f" registro: {', '.join(s['name'] for s in to)}")
+        except (OSError, ug.Busy) as e:
+            self.sess_msg = f"registro non cambiato: {e}"
+        self.state_mtime = None
 
     def update_tab(self, nb):
         box = tk.Frame(nb, padx=10, pady=6)
@@ -982,6 +1113,7 @@ class Widget:
             self.update_tick(now)
             if self.update_label and self.update_label.winfo_exists():
                 self.update_label.configure(text=self.update_text())
+            self.draw_sessions()
             for name in ug.PROVIDERS:
                 pc = self.cfg[name]
                 if not pc["enabled"] or name in self.running:

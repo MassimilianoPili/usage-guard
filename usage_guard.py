@@ -22,6 +22,10 @@ prima di scrivere e torna identico allo sblocco.
            cross-session messaging (un claude -p con SendMessage); quando la
            finestra riparte, quelle in pausa o fermate dal blocco ricevono il
            continue. Serve crossSessionInbound "accept" in settings.json.
+           pause_include e pause_exclude (regex su nome o cartella): sessioni
+           sempre avvisate anche se idle, o mai. Nella scheda Sessioni del
+           widget: il registro di chi avra' il continue, e i pulsanti per
+           mandare pausa e continue a mano.
   Codex    account/rateLimits/read di `codex app-server`, il binario
            dell'estensione VS Code; se fallisce, l'ultimo rate_limits dei log
            di sessione ancora valido. Blocco: openai_base_url in
@@ -141,6 +145,9 @@ DEFAULTS = {
     "update": {"mode": "off", "interval_h": 24},
     "claude": {"enabled": True, "block": True, "limit": 100, "interval": 120,
                "extra_limit": 0, "currency": "", "skip": "",
+               # regex su nome o cartella della sessione: sempre in pausa e continue anche se idle,
+               # o mai; mai vince. Solo per i messaggi automatici, non per i pulsanti della scheda
+               "pause_include": "", "pause_exclude": "",
                "settings": "~/.claude/settings.json", "source": "auto",
                "pause": 0, "resume": True,  # pause 0: spenta
                "near": 10, "near_interval": 60},  # a meno di near punti dalla soglia, un poll ogni near_interval s
@@ -373,10 +380,12 @@ def config_errors(pc):
             errs.append(f"{key} deve essere un intero da {lo} a {hi}, e' {pc[key]!r}")
     if pc.get("source", "auto") not in SOURCES:
         errs.append(f"source deve essere {', '.join(SOURCES)}, e' {pc['source']!r}")
-    try:
-        re.compile(pc.get("skip") or "")
-    except re.error as e:
-        errs.append(f"finestre ignorate: regex non valida ({e})")
+    for key, what in (("skip", "finestre ignorate"), ("pause_include", "sessioni sempre incluse"),
+                      ("pause_exclude", "sessioni mai in pausa")):
+        try:
+            re.compile(pc.get(key) or "")
+        except re.error as e:
+            errs.append(f"{what}: regex non valida ({e})")
     return errs
 
 
@@ -1150,6 +1159,75 @@ def ids(to):
     return ", ".join(f"{s['name']} ({s['sessionId']})" for s in to) or "nessuna"
 
 
+def skey(s):
+    """Una sessione e' il suo processo: il nome puo' ripetersi o cambiare, il pid puo' essere riusato."""
+    return s.get("pid"), s.get("procStart")
+
+
+def session_rule(pc, s):
+    """"mai" se nome o cartella combaciano con pause_exclude, "sempre" con pause_include, se no "".
+    Mai vince su sempre. Valgono per pausa e continue automatici, non per i pulsanti."""
+    for key, rule in (("pause_exclude", "mai"), ("pause_include", "sempre")):
+        rx = pc.get(key)
+        if not rx:
+            continue
+        with contextlib.suppress(re.error):  # una regex non valida la segnala config_errors
+            if any(re.search(rx, str(s.get(f) or ""), re.I) for f in ("name", "cwd")):
+                return rule
+    return ""
+
+
+def auto_targets(pc):
+    """Chi riceve la pausa automatica: le chat al lavoro e quelle in "sempre", meno quelle in "mai".
+    Le idle fuori da "sempre" no: un messaggio aprirebbe un turno."""
+    return [s for s in local_sessions()
+            if session_rule(pc, s) != "mai" and (s["status"] in WORKING or session_rule(pc, s) == "sempre")]
+
+
+def edit_registry(change):
+    """Cambia il registro delle chat in pausa (chi riceve il continue al reset) sotto il lock dello
+    state, che scrive anche il poll. change: lista vecchia -> lista nuova."""
+    with _state_lock, dir_lock(STATE + ".lock", stale=10, wait=5):
+        st = load_state()
+        c = st.setdefault("claude", {})
+        c["paused_sessions"] = change(c.get("paused_sessions") or [])
+        write_atomic(STATE, json.dumps(st, indent=1) + "\n")
+        return c["paused_sessions"]
+
+
+def register(sessions, add=True):
+    """Dalla scheda Sessioni: aggiunge o toglie dal registro, senza messaggi."""
+    keys = {skey(s) for s in sessions}
+    if add:
+        log("claude", f"registro: aggiungo a mano {ids(sessions)}")
+        return edit_registry(lambda reg: merge(reg, sessions))
+    log("claude", f"registro: tolgo a mano {', '.join(s['name'] for s in sessions)}")
+    return edit_registry(lambda reg: [s for s in reg if skey(s) not in keys])
+
+
+def message(pause, sessions):
+    """Dai pulsanti della scheda Sessioni: pausa o continue alle sessioni scelte, regole sempre/mai
+    escluse (l'azione e' dell'utente). La pausa le mette nel registro; il continue toglie quelle che
+    l'hanno ricevuto. Ritorna [(destinatario, esito)]; PollError se l'invio non parte."""
+    pc, st = load_config()["claude"], load_state().get("claude", {})
+    if pause:
+        reason = st.get("pause_reason") or " ".join(f"{w[0]}={w[1]}%" for w in st.get("windows") or [])
+        text, kind = pause_text(pc, reason, to_int(st.get("pause_resets"))), "pausa dalla scheda"
+    else:
+        text, kind = CONTINUE_TEXT, "ripresa dalla scheda"
+    results = send(pc, sessions, text)
+    for name, res in results:
+        log("claude", f"{kind} -> {name}: {res[:160]}")
+    if pause:
+        edit_registry(lambda reg: merge(reg, sessions))
+    else:
+        # il relay indirizza per nome, a volte col [ref] in coda: si toglie chi ha avuto esito buono
+        ok = [n for n, res in results if not res.startswith("ERRORE")]
+        done = {skey(s) for s in sessions if any(n == s["name"] or n.startswith(s["name"] + " ") for n in ok)}
+        edit_registry(lambda reg: [s for s in reg if skey(s) not in done])
+    return results
+
+
 def pause_step(pc, r, st, locked, just_locked):
     """Al pause% le chat al lavoro ricevono la pausa; al blocco si registrano anche quelle che il
     blocco interrompe. Sotto la soglia e senza blocco la finestra e' nuova: il continue va alle
@@ -1160,13 +1238,13 @@ def pause_step(pc, r, st, locked, just_locked):
     fields, action = {}, None
     if hit and not st.get("pause_reason"):
         reason, resets = " ".join(f"{w[0]}={w[1]}%" for w in hit), max(w[2] for w in hit)
-        working = [s for s in local_sessions() if s["status"] in WORKING]
+        working = auto_targets(pc)
         reg = merge(reg, working)
         fields.update(pause_reason=reason, pause_resets=resets, paused_sessions=reg)
         log("claude", f"PAUSA: {reason}, avviso le chat al lavoro: {ids(working)}")
         action = ("pausa", working, pause_text(pc, reason, resets))
     if just_locked and pc["resume"]:
-        stopped = [s for s in local_sessions() if s["status"] in WORKING]
+        stopped = auto_targets(pc)
         log("claude", f"BLOCCO: per il continue registro anche {ids(stopped)}")
         reg = merge(reg, stopped)
         fields.update(paused_sessions=reg, lock_epoch=now(),
@@ -1176,7 +1254,7 @@ def pause_step(pc, r, st, locked, just_locked):
         # e' rimasto fermo su ECONNREFUSED: lo dice il cambio di stato dopo l'inizio del blocco
         since = to_int(st.get("lock_epoch"))
         failed = [s for s in local_sessions() if since and to_int(s.get("statusUpdatedAt")) // 1000 >= since]
-        failed = [s for s in failed if (s["pid"], s["procStart"]) not in {(r["pid"], r["procStart"]) for r in reg}]
+        failed = [s for s in failed if skey(s) not in {skey(r) for r in reg} and session_rule(pc, s) != "mai"]
         if failed:
             log("claude", f"RIPRESA: aggiungo chi ha lavorato durante il blocco: {ids(failed)}")
             reg = merge(reg, failed)
@@ -1200,8 +1278,8 @@ def manual(pause, names):
         for n in sorted(set(names) - {s["name"] for s in to}):
             print(f"Sessione non trovata o chiusa: {n}")
     elif pause:
-        to = [s for s in local_sessions() if s["status"] in WORKING]
-        update_state("claude", paused_sessions=merge(st.get("paused_sessions") or [], to))
+        to = auto_targets(pc)
+        edit_registry(lambda reg: merge(reg, to))
     else:
         to, gone = split_live(st.get("paused_sessions") or [])
         for s in gone:
@@ -1429,7 +1507,7 @@ def block(name, pc=None):
             fields = {"blocked": 1, "manual": 1, "reason": "a mano", "resets": 0,
                       "since": st.get("since") or stamp()}
             if name == "claude" and pc["resume"]:
-                working = [s for s in local_sessions() if s["status"] in WORKING]
+                working = auto_targets(pc)
                 log(name, f"BLOCCO a mano: per il continue registro {ids(working)}")
                 fields.update(paused_sessions=merge(st.get("paused_sessions") or [], working), lock_epoch=now(),
                               pause_reason=st.get("pause_reason") or "blocco a mano")
