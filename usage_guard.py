@@ -18,6 +18,11 @@ prima di scrivere e torna identico allo sblocco.
            ripartono senza riavvio (una chiave tolta resterebbe nel loro env).
            Sotto il limite non blocca mai; oltre, solo se i credits extra del
            mese hanno raggiunto il tetto (0 = nessuna spesa extra).
+           Mentre e' bloccato, ogni 2 s rimette il blocco se qualcuno lo toglie
+           (enforce; un proxy che riscrive il suo URL); readonly lascia il file
+           in sola lettura. Le sessioni Agent SDK non leggono settings.json:
+           per loro c'e' ~/.claude/usage-guard.block, presente solo durante il
+           blocco, e un allarme se la spesa sale col blocco attivo.
            pausa: al pause% le chat al lavoro ricevono "pls pause" via
            cross-session messaging (un claude -p con SendMessage); quando la
            finestra riparte, quelle in pausa o fermate dal blocco ricevono il
@@ -66,6 +71,7 @@ import queue
 import re
 import shutil
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -92,6 +98,9 @@ CONF = os.path.join(DIR, "usage-guard.json")
 STATE = os.path.join(DIR, "usage-guard.state.json")
 LOG = os.path.join(DIR, "usage-guard.log")
 SAVED = os.path.join(DIR, "usage-guard.saved.json")  # valori d'altri sostituiti dal blocco
+# C'e' solo mentre un provider e' bloccato: per chi non legge settings.json (app sull'Agent SDK, proxy)
+BLOCK_SIGNAL = os.path.join(DIR, "usage-guard.block")
+ENFORCE_EVERY = 2  # s fra due controlli del blocco, solo locali: stat del file, e lettura se e' cambiato
 LEGACY_CONF = os.path.join(DIR, "usage-guard.conf")    # versione bash
 LEGACY_STATE = os.path.join(DIR, "usage-guard.state")  # versione bash
 SESSIONS = os.path.join(DIR, "sessions")  # un <pid>.json per sessione di Claude Code
@@ -150,13 +159,17 @@ DEFAULTS = {
                "pause_include": "", "pause_exclude": "",
                "settings": "~/.claude/settings.json", "source": "auto",
                "pause": 0, "resume": True,  # pause 0: spenta
+               # mentre e' bloccato: riscrive il blocco se altri lo tolgono (ogni 2 s); file in sola lettura
+               "enforce": True, "readonly": False,
                "near": 10, "near_interval": 60},  # a meno di near punti dalla soglia, un poll ogni near_interval s
     "codex": {"enabled": False, "block": False, "limit": 100, "interval": 600,
-              "config": "~/.codex/config.toml", "binary": ""},
+              "config": "~/.codex/config.toml", "binary": "",
+              "enforce": True, "readonly": False},
     "copilot": {"enabled": False, "block": False, "limit": 100, "interval": 300,
                 "cache": "%LOCALAPPDATA%/copilot/copilot-user-cache.json",
                 "block_vscode": True, "vscode": "%APPDATA%/Code/User/settings.json",
-                "block_cli": True, "cli": "~/.copilot/config.json"},
+                "block_cli": True, "cli": "~/.copilot/config.json",
+                "enforce": True, "readonly": False},
 }
 # Un valore fuori range e' una digitazione a meta' (1 verso 120): non si applica
 RANGES = {"limit": (1, 100), "interval": (30, 86400)}
@@ -429,7 +442,27 @@ def update_state(name, **fields):
         st = load_state()
         st.setdefault(name, {}).update(fields)
         write_atomic(STATE, json.dumps(st, indent=1) + "\n")
+        if "blocked" in fields:
+            refresh_signal(st)
     return st[name]
+
+
+def refresh_signal(st):
+    """usage-guard.block: c'e' solo mentre un provider e' bloccato, con motivo e reset. Lo leggono
+    i programmi che non passano da settings.json (il 2026-11-01 le sessioni Agent SDK di un progetto
+    hanno speso durante il blocco), prima di chiamare il modello."""
+    on = {n: {"since": s.get("since") or "", "reason": s.get("reason") or "", "resets": to_int(s.get("resets")),
+              "manual": bool(s.get("manual"))}
+          for n, s in st.items() if n in PROVIDERS and isinstance(s, dict) and s.get("blocked") == 1}
+    try:
+        if on:
+            write_atomic(BLOCK_SIGNAL, json.dumps(on, indent=1) + "\n")
+        else:
+            os.remove(BLOCK_SIGNAL)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log("guard", f"ERRORE file di segnale {BLOCK_SIGNAL}: {e}")
 
 
 # --- dove si blocca ------------------------------------------------------------
@@ -455,9 +488,35 @@ class Target:
     blocco vince sul valore d'altri: si salva prima di scrivere e torna allo sblocco."""
     ours = (BLOCK_URL,) + LEGACY_BLOCK
 
-    def __init__(self, label, path, key, block=BLOCK_URL):
+    def __init__(self, label, path, key, block=BLOCK_URL, readonly=False):
         self.label, self.path, self.key, self.block = label, expand(path), key, block
+        self.readonly = readonly  # durante il blocco il file resta in sola lettura: nessuno lo riscrive
         self.ident = f"{self.path}|{key}"
+
+    def set(self):
+        self.unlock()
+        self._set()
+        if self.readonly:
+            self.lock()
+
+    def unset(self):
+        self.unlock()  # anche col blocco gia' tolto da altri: lo sblocco lascia il file scrivibile
+        self._unset()
+
+    def locked(self):
+        try:
+            return not os.stat(self.path).st_mode & stat.S_IWRITE
+        except FileNotFoundError:
+            return False
+
+    def lock(self):
+        with contextlib.suppress(FileNotFoundError):
+            os.chmod(self.path, stat.S_IREAD)
+
+    def unlock(self):
+        # os.replace su un file in sola lettura fallisce: la si toglie prima di ogni scrittura nostra
+        if self.locked():
+            os.chmod(self.path, stat.S_IREAD | stat.S_IWRITE)
 
     def status(self):
         value = self.value()
@@ -495,7 +554,7 @@ class JsonEnvTarget(Target):
     def _write(self, cfg):
         write_atomic(self.path, json.dumps(cfg, indent=2) + "\n")
 
-    def set(self):
+    def _set(self):
         shutil.copyfile(self.path, self.path + ".bak-usage-guard")
         cfg = json.loads(read_text(self.path))
         env = cfg.setdefault("env", {})
@@ -503,7 +562,7 @@ class JsonEnvTarget(Target):
         env[self.key] = self.block
         self._write(cfg)
 
-    def unset(self):
+    def _unset(self):
         cfg = json.loads(read_text(self.path))
         env = cfg.get("env") or {}
         if env.get(self.key) in self.ours:
@@ -539,7 +598,7 @@ class TomlTarget(Target):
         rx = re.compile(rf"^([ \t]*{re.escape(self.key)}[ \t]*=[ \t]*)({token})", re.M)
         return rx.search(text, 0, head.start() if head else len(text))
 
-    def set(self):
+    def _set(self):
         text = self._text()
         data = tomllib.loads(text)
         if self.key not in data:
@@ -557,7 +616,7 @@ class TomlTarget(Target):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         write_atomic(self.path, new)
 
-    def unset(self):
+    def _unset(self):
         text = self._text()
         if tomllib.loads(text).get(self.key) not in self.ours:
             self.forget()
@@ -608,7 +667,7 @@ class JsoncTarget(Target):
                 continue
         return None, None
 
-    def set(self):
+    def _set(self):
         text = self._text()
         data = jsonc_loads(text)
         if self.key not in data:
@@ -628,7 +687,7 @@ class JsoncTarget(Target):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         write_atomic(self.path, new)
 
-    def unset(self):
+    def _unset(self):
         text = self._text()
         if jsonc_loads(text).get(self.key) not in self.ours:
             self.forget()
@@ -648,15 +707,16 @@ class JsoncTarget(Target):
 
 
 def targets(name, pc):
+    ro = bool(pc.get("readonly"))
     if name == "claude":
-        return [JsonEnvTarget("settings.json", pc["settings"], "ANTHROPIC_BASE_URL")]
+        return [JsonEnvTarget("settings.json", pc["settings"], "ANTHROPIC_BASE_URL", readonly=ro)]
     if name == "codex":
-        return [TomlTarget("config.toml", pc["config"], "openai_base_url")]
+        return [TomlTarget("config.toml", pc["config"], "openai_base_url", readonly=ro)]
     out = []
     if pc["block_vscode"]:
-        out.append(JsoncTarget("VS Code", pc["vscode"], "github.copilot.advanced.debug.overrideCapiUrl"))
+        out.append(JsoncTarget("VS Code", pc["vscode"], "github.copilot.advanced.debug.overrideCapiUrl", readonly=ro))
     if pc["block_cli"]:
-        out.append(JsoncTarget("Copilot CLI", pc["cli"], "proxyUrl", block=BLOCK_PROXY))
+        out.append(JsoncTarget("Copilot CLI", pc["cli"], "proxyUrl", block=BLOCK_PROXY, readonly=ro))
     return out
 
 
@@ -1446,8 +1506,17 @@ def _poll(name, pc, force):
     summary += (f" credits={r['credits']}" if r.get("credits") else "") + (f" {r['mode']}" if r.get("mode") else "")
     fields = {k: r.get(k, "") for k in ("windows", "credits", "mode", "note", "retrieved")}
     fields.update(err=r.get("err", ""), last=f"{stamp()} {summary}", skipped="; ".join(skipped))
+    if "used_cents" in r:
+        fields["used_cents"] = r["used_cents"]
     if skipped:
         log(name, "file illeggibili, non li tocco: " + "; ".join(skipped))
+    if name == "claude" and blocked and st.get("blocked") == 1:
+        rise = bypass_rise(st, r)
+        if rise:
+            # bloccato da un poll all'altro, e intanto qualcuno ha usato il modello: il blocco non lo copre
+            fields["bypass"] = f"{stamp()[11:16]} {rise}"
+            log(name, f"ATTENZIONE: {rise} durante il blocco. Un client non passa da settings.json "
+                      "(sessioni Agent SDK, claude.ai, app desktop): fermalo a mano")
 
     just_locked = False
     if hit and pc["block"]:
@@ -1531,6 +1600,61 @@ def block(name, pc=None):
         return False
 
 
+def bypass_rise(st, r):
+    """Cosa e' salito dall'ultimo poll, col blocco gia' attivo: la spesa extra, o una finestra con lo
+    stesso reset. Il 2026-11-01 la spesa e' passata da $0 a $1.52 con settings.json bloccato."""
+    out = []
+    prev = st.get("used_cents")
+    if isinstance(prev, int) and to_int(r.get("used_cents")) > prev:
+        cur = r.get("currency") or "USD"
+        out.append(f"spesa extra da {money(prev, cur)} a {money(to_int(r['used_cents']), cur)}")
+    old = {w[0]: w for w in st.get("windows") or []}
+    for label, pct, reset in r["windows"]:
+        p = old.get(label)
+        if p and pct > p[1] and reset and p[2] and abs(reset - p[2]) <= RESET_SLACK:
+            out.append(f"{label} da {p[1]}% a {pct}%")
+    return "; ".join(out)
+
+
+_seen, _enforce_err = {}, {}  # per file: mtime visto col blocco a posto, ultimo errore loggato
+
+
+def enforce_block(name, pc, st):
+    """Mentre il provider e' bloccato rimette il blocco se qualcuno l'ha tolto o cambiato, e la sola
+    lettura se e' attiva e qualcuno l'ha levata. Dal widget e dal loop ogni ENFORCE_EVERY s: il file
+    si legge solo quando il suo mtime cambia. Il valore trovato diventa quello che torna allo sblocco
+    (l'ultima intenzione di chi l'ha scritto: il proxy che rimette il suo URL, per esempio)."""
+    if st.get("blocked") != 1 or not pc.get("enabled") or not pc.get("enforce", True):
+        return
+    for tg in targets(name, pc):
+        try:
+            mtime = os.stat(tg.path).st_mtime_ns
+        except FileNotFoundError:
+            mtime = None
+        if mtime is not None and _seen.get(tg.ident) == mtime and (not tg.readonly or tg.locked()):
+            continue
+        try:
+            with provider_lock(name, wait=0):
+                status = tg.status()
+                if status != "ours":
+                    found = "chiave tolta" if status == "free" else status[8:-1]
+                    tg.set()
+                    log(name, f"BLOCCO rimesso su {tg.label}: qualcuno l'aveva cambiato ({found}), "
+                              "allo sblocco torna quello")
+                elif tg.readonly and not tg.locked():
+                    tg.lock()
+                    log(name, f"BLOCCO: {tg.label} di nuovo in sola lettura, qualcuno l'aveva levata")
+                _seen[tg.ident] = os.stat(tg.path).st_mtime_ns
+                _enforce_err.pop(tg.ident, None)
+        except Busy:
+            return  # un poll o uno sblocco in corso sullo stesso provider: ci pensano loro
+        except (OSError, ValueError, PollError, tomllib.TOMLDecodeError) as e:
+            # un file a meta' scrittura di altri si legge male per un attimo: si riprova, il log una volta
+            if _enforce_err.get(tg.ident) != str(e):
+                _enforce_err[tg.ident] = str(e)
+                log(name, f"ERRORE: blocco su {tg.label} non verificato ({tg.path}): {e}")
+
+
 def unblock(name, pc=None, why="manuale"):
     """Toglie i blocchi nostri del provider, aspettando un poll in corso. Ritorna
     True se non ne resta nessuno."""
@@ -1555,7 +1679,7 @@ def _unblock(name, pc, why):
             ok = False
             log(name, f"ERRORE: sblocco su {tg.label} ({tg.path}) fallito, blocco ANCORA attivo: {e}")
     if ok:
-        update_state(name, blocked=0, reason="", resets=0, since="", manual=0)
+        update_state(name, blocked=0, reason="", resets=0, since="", manual=0, bypass="")
         hint = {"claude": "Le sessioni aperte ripartono da sole",
                 "codex": "Riapri le conversazioni rimaste aperte",
                 "copilot": "Riavvia il CLI copilot se era aperto"}[name]
@@ -1815,7 +1939,13 @@ def loop(only):
         # al risveglio lo state e' fresco e il turno salta
         st, t = load_state(), now()
         due = [int(st.get(n, {}).get("poll_epoch") or 0) + interval(n, cfg[n], st.get(n, {})) - t for n in on]
-        time.sleep(min(max(5, min(due, default=60)), 300))
+        wake = time.time() + min(max(5, min(due, default=60)), 300)
+        # fra un poll e l'altro, col blocco attivo, si controlla che nessuno l'abbia tolto
+        while time.time() < wake:
+            st = load_state()
+            for name in on:
+                enforce_block(name, cfg[name], st.get(name, {}))
+            time.sleep(min(ENFORCE_EVERY, max(0.1, wake - time.time())))
 
 
 def update_cli(mode, args):

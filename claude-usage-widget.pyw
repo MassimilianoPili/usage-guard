@@ -944,6 +944,8 @@ class Widget:
 
         check("Attivo: spento non viene nemmeno letto", "enabled")
         check("Blocca al limite", "block")
+        check("Col blocco attivo, riscrivilo se qualcuno lo toglie (ogni 2 s)", "enforce")
+        check("Col blocco attivo, file in sola lettura (anche per Claude Code e VS Code)", "readonly")
         spin("Limite % delle finestre", "limit", 1, 100)
         spin("Intervallo fra i poll, s", "interval", 30, 86400, inc=30)
         if name == "claude":
@@ -1136,6 +1138,9 @@ class Widget:
             self.draw_sessions()
             for name in ug.PROVIDERS:
                 pc = self.cfg[name]
+                if pc["enabled"]:
+                    # col blocco attivo: se qualcuno l'ha tolto si rimette subito, non al prossimo poll
+                    ug.enforce_block(name, pc, self.state.get(name, {}))
                 if not pc["enabled"] or name in self.running:
                     continue  # spento: nessun controllo
                 last = max(num(self.state.get(name, {}).get("poll_epoch")), self.last_run.get(name, 0))
@@ -1193,6 +1198,9 @@ class Widget:
         err = self.errs.get(name) or st.get("err", "")
         if err:
             segs.append((err if len(err) <= 60 else err[:59] + "…", WARN, False))
+        if blocked and st.get("bypass"):
+            # la spesa sale col blocco attivo: qualcosa non passa da settings.json, va fermato a mano
+            segs.append((f"SPESA COL BLOCCO {st['bypass']}"[:70], "#ffffff" if p["transp"] < 50 else BAD, True))
         if name in self.running:
             segs.append(("…", DIM, False))
         if len(segs) == 1:
