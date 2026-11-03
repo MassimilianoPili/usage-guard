@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import usage_guard as ug  # noqa: E402
 
 PREFS = os.path.join(ug.DIR, "usage-guard.widget")
+SESSION_SECONDS = 5 * 3600  # la finestra di sessione di Claude: five_hour nella risposta dell'API
 TICK_MS = 2000
 
 BG, BG_BLOCK = "#1e1e1e", "#6b1414"
@@ -52,6 +53,7 @@ DOCK_NAMES = {"tl": "in alto a sinistra", "tc": "in alto al centro", "tr": "in a
 DEFAULTS = {
     "x": None, "y": None,  # il punto fisso del box (align, valign), non l'angolo in alto a sinistra
     "show_session": True, "show_reset": True, "show_credits": True, "show_overage": True,
+    "show_elapsed": True,  # accanto al reset della sessione di Claude, la % di tempo gia' passata
     "hidden": [],  # "provider:finestra" nascoste: una finestra nuova si vede
     "labels": "Session, W",
     "transp": 0, "font": 9, "topmost": True, "warn": 80,
@@ -540,6 +542,7 @@ class Widget:
 
         box = section(0, "Elementi")
         for key, text in (("show_session", "Claude: Session %"), ("show_reset", "Tempo al reset della prima finestra"),
+                          ("show_elapsed", "Claude: % di tempo passato della sessione, accanto al reset"),
                           ("show_credits", "Crediti"), ("show_overage", "Claude: overage")):
             tk.Checkbutton(box, text=text, variable=pref(tk.BooleanVar, key)).pack(anchor="w")
         for name in ug.PROVIDERS:
@@ -1185,7 +1188,12 @@ class Widget:
                          else WARN if pct * 100 >= limit * p["warn"] else OK)
                 segs.append((f"{short(label, names)} {pct}%", color, True))
             if i == 0 and p["show_reset"] and reset > now:
-                segs.append((ug.fmt_left(reset - now), DIM, False))
+                left = ug.fmt_left(reset - now)
+                if name == "claude" and label == "session" and p["show_elapsed"]:
+                    # tempo passato della finestra, da confrontare con la % d'uso: 1h32m (69%) su 5 h
+                    passed = min(100, max(0, int(100 * (1 - (reset - now) / SESSION_SECONDS))))
+                    left += f" ({passed}%)"
+                segs.append((left, DIM, False))
         if p["show_credits"] and st.get("credits"):
             # "$1051.67/$4000.00(26%)" diventa "$1051/$4000"
             credits = re.sub(r"\.\d+|\(.*\)", "", st["credits"]) if name == "claude" else st["credits"]
