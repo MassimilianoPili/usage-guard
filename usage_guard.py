@@ -834,7 +834,9 @@ def spend_window(x, spend=None):
     lim = x.get("monthly_limit")
     if isinstance(lim, (int, float)) and lim > 0:
         pct = x["utilization"] if isinstance(x.get("utilization"), (int, float)) else (x.get("used_credits") or 0) / lim * 100
-        return [[SPEND, int(pct), 0]]
+        # arrotondato, non troncato: con utilization 2.966 il blocco spend del body e la pagina
+        # Usage dicono 3% (risposta vera di un posto Enterprise general, 2026-11-05)
+        return [[SPEND, round(pct), 0]]
     if isinstance((spend or {}).get("percent"), (int, float)):
         return [[SPEND, int(spend["percent"]), 0]]
     return []
@@ -862,7 +864,7 @@ def extra_credits(x, r):
         pct = x["utilization"] if isinstance(x.get("utilization"), (int, float)) else (used / lim * 100 if lim > 0 else 0)
         cur = (x.get("currency") or "USD").upper()
         r.update(used_cents=used, currency=cur,
-                 credits=f"{money(used, cur)}/{money(lim, cur) if lim > 0 else 'illimitato'}({int(pct)}%)")
+                 credits=f"{money(used, cur)}/{money(lim, cur) if lim > 0 else 'illimitato'}({round(pct)}%)")
 
 
 def read_claude_cli(pc, blocked):
