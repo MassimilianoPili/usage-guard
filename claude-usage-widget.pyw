@@ -154,6 +154,7 @@ K32.OpenProcess.restype = ctypes.c_void_p
 K32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 K32.CloseHandle.argtypes = [ctypes.c_void_p]
 UPDATE_EVERY = 600  # s fra due controlli dal widget; in rete si va solo ogni update.interval_h ore
+UPDATE_MARK = "⚠"  # aggiornamento disponibile: tasto destro, Aggiorna a vX
 
 
 def monitor_rect(x, y):
@@ -1225,8 +1226,8 @@ class Widget:
         if not rows:
             rows.append([("nessun provider attivo: tasto destro, Impostazioni", DIM, False)])
         if self.update_tag:
-            rows.append([(f"aggiornamento {self.update_tag}: tasto destro, Aggiorna" if ug.installed() else
-                          f"{self.update_tag} disponibile: python usage_guard.py --install", WARN, False)])
+            # solo un segno in fondo alla prima riga: la versione e il comando stanno nel menu
+            rows[0] = rows[0] + [(UPDATE_MARK, WARN, True)]
         if self.cfg_err:
             rows.append([(self.cfg_err[:80], WARN, False)])
         if (blocked, rows) == self.shown:
