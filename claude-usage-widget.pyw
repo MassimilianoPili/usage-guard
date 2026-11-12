@@ -230,6 +230,7 @@ class Widget:
         # aggiornamenti: il thread scrive solo questi campi, Tk li legge nel tick
         self.update_tag, self.update_busy, self.update_last, self.restart_pending = None, False, 0, False
         self.update_label, self.update_button, self.installed_tag, self.closed = None, None, None, False
+        self.update_nb, self.update_tab_id = None, None
         self.acct_list, self.acct_shown, self.acct_name, self.acct_msg = None, None, None, None
         # scheda Sessioni: il thread d'invio scrive solo sess_msg e sess_busy
         self.sess_list, self.sess_shown, self.sess_sel, self.sess_by_key = None, None, set(), {}
@@ -746,29 +747,40 @@ class Widget:
                       else f"ok ({fmt_left(exp - time.time())})" if exp else "?")
             last = ast_.get("last", "")
             err = ast_.get("err", "")
+            visible = info.get("visible", True)
             rows.append((name, info.get("subscriptionType", "?"), status, is_active,
-                         info.get("organizationUuid", "")[:8], last[:50] if last else "", err[:60] if err else ""))
+                         info.get("organizationUuid", "")[:8], last[:50] if last else "", err[:60] if err else "",
+                         visible))
         if rows == self.acct_shown:
             return
         self.acct_shown = rows
         for w in self.acct_list.winfo_children():
             w.destroy()
-        for col, text in enumerate(("Nome", "Tipo", "Stato", "Org", "Ultimo poll", "Errore")):
+        for col, text in enumerate(("Visibile", "Nome", "Tipo", "Stato", "Org", "Ultimo poll", "Errore")):
             tk.Label(self.acct_list, text=text, font=("Segoe UI", 9, "bold")).grid(
                 row=0, column=col, sticky="w", padx=(0, 8))
         if not rows:
             tk.Label(self.acct_list, text="Nessuna utenza aggiuntiva. Fai claude /login e poi Salva utenza corrente.",
-                     fg="gray40").grid(row=1, column=0, columnspan=6, sticky="w")
-        for i, (name, sub, status, active, org, last, err) in enumerate(rows, 1):
+                     fg="gray40").grid(row=1, column=0, columnspan=7, sticky="w")
+        for i, (name, sub, status, active, org, last, err, visible) in enumerate(rows, 1):
+            def toggle_vis(on, n=name):
+                try:
+                    ug.set_account_visible(n, on)
+                except ug.PollError:
+                    pass
+                self.acct_shown = None
+                self.shown = None  # la riga nel widget cambia subito
+            tk.Checkbutton(self.acct_list, variable=self.bound(tk.BooleanVar, visible, toggle_vis)).grid(
+                row=i, column=0, sticky="w")
             fg = "dark green" if active else "gray10"
-            tk.Label(self.acct_list, text=name, fg=fg).grid(row=i, column=0, sticky="w")
-            tk.Label(self.acct_list, text=sub, fg="gray40").grid(row=i, column=1, sticky="w", padx=(0, 8))
+            tk.Label(self.acct_list, text=name, fg=fg).grid(row=i, column=1, sticky="w")
+            tk.Label(self.acct_list, text=sub, fg="gray40").grid(row=i, column=2, sticky="w", padx=(0, 8))
             tk.Label(self.acct_list, text=status, fg="dark green" if "ok" in status or active else
-                     "firebrick" if "scaduto" in status else "gray40").grid(row=i, column=2, sticky="w", padx=(0, 8))
-            tk.Label(self.acct_list, text=org, fg="gray40").grid(row=i, column=3, sticky="w", padx=(0, 8))
-            tk.Label(self.acct_list, text=last, fg="gray40").grid(row=i, column=4, sticky="w", padx=(0, 8))
+                     "firebrick" if "scaduto" in status else "gray40").grid(row=i, column=3, sticky="w", padx=(0, 8))
+            tk.Label(self.acct_list, text=org, fg="gray40").grid(row=i, column=4, sticky="w", padx=(0, 8))
+            tk.Label(self.acct_list, text=last, fg="gray40").grid(row=i, column=5, sticky="w", padx=(0, 8))
             if err:
-                tk.Label(self.acct_list, text=err, fg="firebrick").grid(row=i, column=5, sticky="w")
+                tk.Label(self.acct_list, text=err, fg="firebrick").grid(row=i, column=6, sticky="w")
 
     def acct_save(self):
         name = self.acct_name.get().strip()
@@ -827,6 +839,7 @@ class Widget:
     def update_tab(self, nb):
         box = tk.Frame(nb, padx=10, pady=6)
         nb.add(box, text="Aggiornamenti")
+        self.update_nb, self.update_tab_id = nb, nb.tabs()[-1]
         u = self.cfg["update"]
         tk.Label(box, text="Modalita'").grid(row=0, column=0, sticky="w")
         ttk.Combobox(box, values=ug.UPDATE_MODES, state="readonly", width=7,
@@ -1265,6 +1278,12 @@ class Widget:
                 self.update_label.configure(text=self.update_text())
                 label, ok = self.update_action()  # il controllo e' in un thread: il pulsante segue al tick
                 self.update_button.configure(text=label, state="normal" if ok else "disabled")
+                # il segno nel titolo della scheda, non nella riga del widget
+                title = f"Aggiornamenti {UPDATE_MARK}" if self.update_tag else "Aggiornamenti"
+                try:
+                    self.update_nb.tab(self.update_tab_id, text=title)
+                except tk.TclError:
+                    pass
             self.draw_sessions()
             self.draw_accounts()
             ug.auto_refresh_accounts()
@@ -1352,9 +1371,11 @@ class Widget:
                 segs, b = self.row(name, now)
                 rows.append(segs)
                 blocked |= b
-        # righe delle utenze aggiuntive
+        # righe delle utenze aggiuntive (solo quelle con visible=true)
         acct_state = self.state.get("accounts") or {}
-        for name in sorted(ug.list_accounts()):
+        for name, info in sorted(ug.list_accounts().items()):
+            if not info.get("visible", True):
+                continue
             ast_ = acct_state.get(name, {})
             segs = [(name, DIM, True)]
             for label, pct, _reset in ast_.get("windows") or []:
@@ -1369,9 +1390,7 @@ class Widget:
             rows.append(segs)
         if not rows:
             rows.append([("nessun provider attivo: tasto destro, Impostazioni", DIM, False)])
-        if self.update_tag:
-            # solo un segno in fondo alla prima riga: la versione e il comando stanno nel menu
-            rows[0] = rows[0] + [(UPDATE_MARK, WARN, True)]
+        # il segno di aggiornamento sta nel titolo della scheda Aggiornamenti, non nella riga del widget
         if self.cfg_err:
             rows.append([(self.cfg_err[:80], WARN, False)])
         if (blocked, rows) == self.shown:

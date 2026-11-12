@@ -1727,6 +1727,7 @@ def list_accounts():
                     "scopes": o.get("scopes") or [],
                     "hasToken": bool(o.get("accessToken")),
                     "hasRefresh": bool(o.get("refreshToken")),
+                    "visible": data.get("visible", True),  # nel widget: riga visibile o nascosta
                 }
             except (OSError, ValueError):
                 out[name] = {"err": "file illeggibile"}
@@ -1759,6 +1760,17 @@ def remove_account(name):
         raise PollError(f"utenza '{name}' non trovata")
     os.remove(path)
     log("account", f"rimossa utenza '{name}'")
+
+
+def set_account_visible(name, visible):
+    """Accende o spegne la riga dell'utenza nel widget, senza toccare i token."""
+    path = account_path(name)
+    try:
+        data = json.loads(read_text(path))
+    except (FileNotFoundError, ValueError) as e:
+        raise PollError(f"utenza '{name}' non leggibile: {e}")
+    data["visible"] = bool(visible)
+    write_atomic(path, json.dumps(data, indent=2) + "\n")
 
 
 def load_account_cred(name):
