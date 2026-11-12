@@ -43,6 +43,8 @@ prima di scrivere e torna identico allo sblocco.
 Uso: python usage_guard.py [--widget|--loop|--once|--status|--block|--unblock|--config|--help] [provider]
      python usage_guard.py --pause|--resume [sessione ...]
      python usage_guard.py --version|--check-update|--install [vX.Y.Z]
+     python usage_guard.py --save-account|--remove-account|--switch|--refresh-account <nome>
+     python usage_guard.py --list-accounts
 --block blocca a mano, anche sotto i limiti: il poll non lo toglie, resta fino a
 --unblock; allo sblocco le chat di Claude che lavoravano ricevono il continue.
 --pause e --resume mandano il messaggio a mano: senza nomi, la pausa va alle chat
@@ -105,6 +107,7 @@ LEGACY_CONF = os.path.join(DIR, "usage-guard.conf")    # versione bash
 LEGACY_STATE = os.path.join(DIR, "usage-guard.state")  # versione bash
 SESSIONS = os.path.join(DIR, "sessions")  # un <pid>.json per sessione di Claude Code
 CREDENTIALS = os.path.join(DIR, ".credentials.json")  # token OAuth di Claude Code, solo letto
+ACCOUNTS_DIR = os.path.join(DIR, "usage-guard-accounts")  # un <nome>.json per utenza aggiuntiva
 # La copia installata, quella che si aggiorna da sola; la cartella di sviluppo non si tocca mai
 INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local"),
                            "usage-guard")
@@ -133,6 +136,9 @@ DEFAULT_URL = "https://api.anthropic.com"  # Claude: lo sblocco lo scrive al pos
 # Diretto, non da ANTHROPIC_BASE_URL: il blocco non lo ferma, si legge anche da bloccati
 USAGE_URL = DEFAULT_URL + "/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # il client pubblico di Claude Code (produzione)
+REFRESH_INTERVAL = 6 * 3600  # s fra un refresh e l'altro delle utenze non attive: il token dura 8 h
 SOURCES = ("auto", "api", "cli")  # auto: API, se fallisce claude -p /usage
 LEGACY_BLOCK = ("http://127.0.0.1:9",)  # della versione bash: si riconosce e si toglie
 NOWIN = subprocess.CREATE_NO_WINDOW
@@ -1689,6 +1695,204 @@ def _unblock(name, pc, why):
     return ok
 
 
+# --- utenze (multi-account) -------------------------------------------------------
+# Ogni utenza aggiuntiva vive in usage-guard-accounts/<nome>.json con la stessa forma di
+# .credentials.json (claudeAiOauth: accessToken, refreshToken, expiresAt, refreshTokenExpiresAt,
+# scopes, subscriptionType, organizationUuid). Il guard le tiene vive con un refresh ogni
+# REFRESH_INTERVAL e ne legge l'uso come per l'utenza principale. L'utenza attiva (quella che
+# Claude Code usa) e' sempre quella in .credentials.json: "switch" significa scrivere i token
+# dell'utenza scelta li' dentro e mettere quelli di prima nell'account file.
+
+
+def account_path(name):
+    return os.path.join(ACCOUNTS_DIR, f"{name}.json")
+
+
+def list_accounts():
+    """Le utenze aggiuntive configurate, {nome: {subscriptionType, organizationUuid, expiresAt, ...}}."""
+    out = {}
+    try:
+        for f in os.listdir(ACCOUNTS_DIR):
+            if not f.endswith(".json"):
+                continue
+            name = f[:-5]
+            try:
+                data = json.loads(read_text(os.path.join(ACCOUNTS_DIR, f)))
+                o = data.get("claudeAiOauth") or {}
+                out[name] = {
+                    "subscriptionType": o.get("subscriptionType") or "?",
+                    "organizationUuid": data.get("organizationUuid") or "",
+                    "expiresAt": to_int(o.get("expiresAt")),
+                    "refreshTokenExpiresAt": to_int(o.get("refreshTokenExpiresAt")),
+                    "scopes": o.get("scopes") or [],
+                    "hasToken": bool(o.get("accessToken")),
+                    "hasRefresh": bool(o.get("refreshToken")),
+                }
+            except (OSError, ValueError):
+                out[name] = {"err": "file illeggibile"}
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def save_account(name):
+    """Copia l'utenza corrente di Claude Code (.credentials.json) con il nome dato. La si chiama
+    dopo aver fatto claude /login sull'account da salvare, prima di tornare al proprio account."""
+    try:
+        cred = json.loads(read_text(CREDENTIALS))
+    except (FileNotFoundError, ValueError) as e:
+        raise PollError(f"credenziali di Claude Code non leggibili: {e}")
+    o = cred.get("claudeAiOauth") or {}
+    if not o.get("accessToken") or not o.get("refreshToken"):
+        raise PollError("credenziali di Claude Code senza token: fai claude /login prima")
+    os.makedirs(ACCOUNTS_DIR, exist_ok=True)
+    write_atomic(account_path(name), json.dumps(cred, indent=2) + "\n")
+    sub = o.get("subscriptionType") or "?"
+    org = cred.get("organizationUuid") or ""
+    log("account", f"salvata utenza '{name}' ({sub}, org {org[:8]}...) da {CREDENTIALS}")
+    return sub, org
+
+
+def remove_account(name):
+    path = account_path(name)
+    if not os.path.isfile(path):
+        raise PollError(f"utenza '{name}' non trovata")
+    os.remove(path)
+    log("account", f"rimossa utenza '{name}'")
+
+
+def load_account_cred(name):
+    """I token dell'utenza, letti dal suo file. PollError se mancano o sono scaduti."""
+    path = account_path(name)
+    try:
+        cred = json.loads(read_text(path))
+    except FileNotFoundError:
+        raise PollError(f"utenza '{name}' non trovata")
+    except (OSError, ValueError) as e:
+        raise PollError(f"utenza '{name}' illeggibile: {e}")
+    o = cred.get("claudeAiOauth") or {}
+    if not o.get("accessToken"):
+        raise PollError(f"utenza '{name}' senza access token")
+    return cred, o
+
+
+def refresh_account(name):
+    """Un refresh dell'utenza: chiama il token endpoint, scrive i nuovi token nel file dell'utenza.
+    Non tocca mai .credentials.json: quello lo fa solo switch. Ritorna il nuovo expiresAt (ms)."""
+    cred, o = load_account_cred(name)
+    if not o.get("refreshToken"):
+        raise PollError(f"utenza '{name}' senza refresh token: rifai --save-account")
+    rt_exp = to_int(o.get("refreshTokenExpiresAt")) // 1000
+    if rt_exp and rt_exp <= now():
+        raise PollError(f"utenza '{name}': refresh token scaduto ({fmt_epoch(rt_exp)}): rifai --save-account")
+    data = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": o["refreshToken"],
+        "client_id": CLIENT_ID,
+        "scope": " ".join(o.get("scopes") or []),
+    }).encode()
+    req = urllib.request.Request(TOKEN_URL, data=data, headers={
+        "Content-Type": "application/json", "User-Agent": f"usage-guard/{__version__}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=tls_context()) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise PollError(f"refresh di '{name}': HTTP {e.code}")
+    except (urllib.error.URLError, OSError) as e:
+        raise PollError(f"refresh di '{name}': {getattr(e, 'reason', e)}")
+    for key in ("access_token", "refresh_token"):
+        if key not in body:
+            raise PollError(f"refresh di '{name}': la risposta non ha '{key}'")
+    o["accessToken"] = body["access_token"]
+    o["refreshToken"] = body["refresh_token"]
+    o["expiresAt"] = int(time.time() + body["expires_in"]) * 1000
+    rt_seconds = body.get("refresh_token_expires_in") or 12 * 86400
+    o["refreshTokenExpiresAt"] = int(time.time() + rt_seconds) * 1000
+    cred["claudeAiOauth"] = o
+    if body.get("organization"):
+        cred["organizationUuid"] = body["organization"].get("uuid") or cred.get("organizationUuid") or ""
+    write_atomic(account_path(name), json.dumps(cred, indent=2) + "\n")
+    log("account", f"refreshata utenza '{name}', accessToken scade fra {body['expires_in'] // 3600} h")
+    return o["expiresAt"]
+
+
+def switch_account(name):
+    """Mette l'utenza scelta in .credentials.json e quella di prima nel suo file (se ne ha uno).
+    Le sessioni di Claude Code aperte prenderanno il nuovo token alla prossima chiamata API."""
+    new_cred, new_o = load_account_cred(name)
+    # Chi c'era prima: lo si salva, se ha un nome registrato
+    try:
+        old_cred = json.loads(read_text(CREDENTIALS))
+        old_org = old_cred.get("organizationUuid") or ""
+    except (FileNotFoundError, ValueError):
+        old_cred, old_org = None, ""
+    # Cerca l'utenza attuale fra quelle salvate, per org
+    old_name = None
+    if old_cred and old_org:
+        for n, info in list_accounts().items():
+            if info.get("organizationUuid") == old_org and n != name:
+                old_name = n
+                break
+    if old_cred and old_name:
+        write_atomic(account_path(old_name), json.dumps(old_cred, indent=2) + "\n")
+        log("account", f"utenza attiva '{old_name}' (org {old_org[:8]}...) salvata nel suo file")
+    write_atomic(CREDENTIALS, json.dumps(new_cred, indent=2) + "\n")
+    new_org = new_cred.get("organizationUuid") or ""
+    log("account", f"switch a '{name}' (org {new_org[:8]}...): scritto in {CREDENTIALS}")
+    return new_org
+
+
+def read_account_usage(name):
+    """L'uso di un'utenza aggiuntiva: stessa logica di read_claude_api ma col token dell'utenza."""
+    _cred, o = load_account_cred(name)
+    if to_int(o.get("expiresAt")) // 1000 <= now():
+        raise PollError(f"utenza '{name}': token scaduto, il prossimo refresh lo rinnova")
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {o['accessToken']}", "anthropic-beta": OAUTH_BETA,
+        "Accept": "application/json", "User-Agent": f"usage-guard/{__version__}"})
+    try:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT, context=tls_context()) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise PollError({401: f"utenza '{name}': token revocato (401)",
+                         403: f"utenza '{name}': senza permesso (403)",
+                         429: f"utenza '{name}': troppe richieste (429)"}.get(e.code, f"utenza '{name}': HTTP {e.code}"))
+    except (urllib.error.URLError, OSError) as e:
+        raise PollError(f"utenza '{name}' non raggiungibile: {getattr(e, 'reason', e)}")
+    if not isinstance(body, dict):
+        raise PollError(f"utenza '{name}': risposta senza oggetto JSON")
+    return usage_from_body(body)
+
+
+def auto_refresh_accounts():
+    """Refresha le utenze il cui token scade entro REFRESH_INTERVAL. Chiamata dal widget e dal loop."""
+    for name, info in list_accounts().items():
+        if not info.get("hasRefresh"):
+            continue
+        exp = info.get("expiresAt", 0) // 1000
+        if exp and exp - now() < REFRESH_INTERVAL:
+            try:
+                refresh_account(name)
+            except PollError as e:
+                log("account", f"ERRORE refresh di '{name}': {e}")
+
+
+def poll_accounts():
+    """Legge l'uso di ogni utenza aggiuntiva e lo mette nello state, sotto accounts.<nome>."""
+    for name in list_accounts():
+        try:
+            r = read_account_usage(name)
+            update_state("accounts", **{name: {
+                "windows": r["windows"], "credits": r.get("credits", ""), "mode": r["mode"],
+                "note": r.get("note", ""), "poll_epoch": now(), "err": "",
+                "last": f"{stamp()} " + " ".join(f"{w[0]}={w[1]}%" for w in r["windows"])
+                         + (f" credits={r['credits']}" if r.get("credits") else ""),
+            }})
+        except PollError as e:
+            update_state("accounts", **{name: {"err": str(e), "poll_epoch": now()}})
+            log("account", f"ERRORE poll '{name}': {e}")
+
+
 # --- aggiornamenti ---------------------------------------------------------------
 def parse_version(tag):
     """'v1.2.3' o '1.2.3' -> (1, 2, 3); None se non e' una versione."""
@@ -1937,6 +2141,8 @@ def loop(only):
         on = [n for n in only if cfg[n]["enabled"]]
         for name in on:
             poll(name)
+        auto_refresh_accounts()
+        poll_accounts()
         # Si dorme fino al primo provider in scadenza: se il widget fa il poll prima,
         # al risveglio lo state e' fresco e il turno salta
         st, t = load_state(), now()
@@ -1948,6 +2154,34 @@ def loop(only):
             for name in on:
                 enforce_block(name, cfg[name], st.get(name, {}))
             time.sleep(min(ENFORCE_EVERY, max(0.1, wake - time.time())))
+
+
+def account_cli(mode, args):
+    if mode == "--list-accounts":
+        for name, info in sorted(list_accounts().items()):
+            exp = info.get("expiresAt", 0) // 1000
+            status = ("scaduto" if exp and exp <= now() else
+                      f"ok, scade fra {fmt_left(exp - now())}" if exp else "?")
+            print(f"  {name}: {info.get('subscriptionType', '?')} org={info.get('organizationUuid', '?')[:8]}... {status}")
+        if not list_accounts():
+            print("Nessuna utenza salvata. Usa --save-account <nome> dopo un claude /login.")
+        return 0
+    if not args:
+        raise SystemExit(f"{mode} richiede il nome dell'utenza. Esempio: {mode} collega")
+    name = args[0]
+    if mode == "--save-account":
+        sub, org = save_account(name)
+        print(f"Salvata '{name}' ({sub}, org {org[:8]}...) in {account_path(name)}")
+    elif mode == "--remove-account":
+        remove_account(name)
+        print(f"Rimossa '{name}'.")
+    elif mode == "--switch":
+        org = switch_account(name)
+        print(f"Switch a '{name}' (org {org[:8]}...): le sessioni aperte cambieranno alla prossima chiamata.")
+    elif mode == "--refresh-account":
+        exp = refresh_account(name)
+        print(f"Refreshata '{name}': accessToken scade alle {fmt_epoch(exp // 1000)}.")
+    return 0
 
 
 def update_cli(mode, args):
@@ -1980,6 +2214,9 @@ def main(argv):
     if mode in ("--version", "--check-update", "--install"):
         os.makedirs(DIR, exist_ok=True)
         return update_cli(mode, argv[1:])
+    if mode in ("--save-account", "--remove-account", "--switch", "--list-accounts", "--refresh-account"):
+        os.makedirs(DIR, exist_ok=True)
+        return account_cli(mode, argv[1:])
     only = [p for p in argv[1:] if p in PROVIDERS] or list(PROVIDERS)
     if any(p not in PROVIDERS for p in argv[1:]):
         raise SystemExit(f"Provider sconosciuto. Validi: {', '.join(PROVIDERS)}")

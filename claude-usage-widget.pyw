@@ -230,6 +230,7 @@ class Widget:
         # aggiornamenti: il thread scrive solo questi campi, Tk li legge nel tick
         self.update_tag, self.update_busy, self.update_last, self.restart_pending = None, False, 0, False
         self.update_label, self.update_button, self.installed_tag, self.closed = None, None, None, False
+        self.acct_list, self.acct_shown, self.acct_name, self.acct_msg = None, None, None, None
         # scheda Sessioni: il thread d'invio scrive solo sess_msg e sess_busy
         self.sess_list, self.sess_shown, self.sess_sel, self.sess_by_key = None, None, set(), {}
         self.sess_msg, self.sess_busy, self.sess_buttons, self.sess_result = "", False, [], None
@@ -479,7 +480,8 @@ class Widget:
             return
         w = self.win = tk.Toplevel(self.root)
         # i disegni, il campo aperto e la tabella delle sessioni erano della finestra chiusa
-        self.dock_canvas = self.box_canvas = self.edit_close = self.sess_list = None
+        self.dock_canvas = self.box_canvas = self.edit_close = self.sess_list = self.acct_list = None
+        self.acct_shown = None
         self.editing = False
         w.withdraw()  # si mostra dopo, gia' al suo posto
         w.title("usage guard")
@@ -495,6 +497,7 @@ class Widget:
         self.layout_tab(nb)
         tabs = {name: self.provider_tab(nb, name) for name in ug.PROVIDERS}
         nb.insert(tabs["codex"], self.sessions_tab(nb))  # subito dopo Claude
+        nb.insert(tabs["codex"], self.accounts_tab(nb))  # dopo Sessioni, prima di Codex
         self.update_tab(nb)
         if first:
             nb.select(tabs["claude"])
@@ -697,6 +700,129 @@ class Widget:
         except (OSError, ug.Busy) as e:
             self.sess_msg = f"registro non cambiato: {e}"
         self.state_mtime = None
+
+    # --- scheda Utenze ---------------------------------------------------------------
+    def accounts_tab(self, nb):
+        tab = tk.Frame(nb, padx=8, pady=6)
+        nb.add(tab, text="Utenze")
+        self.acct_list = tk.Frame(tab)
+        self.acct_list.grid(row=0, column=0, sticky="w")
+        self.acct_shown = None
+        bar = tk.Frame(tab)
+        bar.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        for text, cmd in (("Salva utenza corrente", self.acct_save), ("Rimuovi", self.acct_remove),
+                          ("Switch", self.acct_switch), ("Refresh", self.acct_refresh)):
+            tk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 6))
+        self.acct_msg = tk.Label(tab, text="", fg="gray40", justify="left", wraplength=620)
+        self.acct_msg.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        tk.Label(tab, text="Salva: salva l'utenza con cui Claude Code e' loggato adesso (fai prima claude /login).\n"
+                           "Switch: scrive i token dell'utenza scelta in .credentials.json: le sessioni aperte cambiano.\n"
+                           "Refresh: rinnova il token di un'utenza; il refresh automatico ogni ~6 h e' sempre acceso.",
+                 fg="gray40", justify="left").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.acct_name = tk.StringVar()
+        row = tk.Frame(tab)
+        row.grid(row=4, column=0, sticky="w", pady=(4, 0))
+        tk.Label(row, text="Nome:").pack(side="left")
+        tk.Entry(row, textvariable=self.acct_name, width=20).pack(side="left", padx=(4, 0))
+        self.draw_accounts()
+        return tab
+
+    def draw_accounts(self):
+        if not (self.acct_list and self.win and self.win.winfo_exists() and self.acct_list.winfo_exists()):
+            return
+        accounts = sorted(ug.list_accounts().items())
+        # l'utenza attiva: la si riconosce dall'org
+        try:
+            active_org = json.loads(ug.read_text(ug.CREDENTIALS)).get("organizationUuid")
+        except (OSError, ValueError):
+            active_org = None
+        acct_state = self.state.get("accounts") or {}
+        rows = []
+        for name, info in accounts:
+            exp = info.get("expiresAt", 0) // 1000
+            ast_ = acct_state.get(name, {})
+            is_active = info.get("organizationUuid") and info["organizationUuid"] == active_org
+            status = ("attiva" if is_active else "scaduto" if exp and exp <= time.time()
+                      else f"ok ({fmt_left(exp - time.time())})" if exp else "?")
+            last = ast_.get("last", "")
+            err = ast_.get("err", "")
+            rows.append((name, info.get("subscriptionType", "?"), status, is_active,
+                         info.get("organizationUuid", "")[:8], last[:50] if last else "", err[:60] if err else ""))
+        if rows == self.acct_shown:
+            return
+        self.acct_shown = rows
+        for w in self.acct_list.winfo_children():
+            w.destroy()
+        for col, text in enumerate(("Nome", "Tipo", "Stato", "Org", "Ultimo poll", "Errore")):
+            tk.Label(self.acct_list, text=text, font=("Segoe UI", 9, "bold")).grid(
+                row=0, column=col, sticky="w", padx=(0, 8))
+        if not rows:
+            tk.Label(self.acct_list, text="Nessuna utenza aggiuntiva. Fai claude /login e poi Salva utenza corrente.",
+                     fg="gray40").grid(row=1, column=0, columnspan=6, sticky="w")
+        for i, (name, sub, status, active, org, last, err) in enumerate(rows, 1):
+            fg = "dark green" if active else "gray10"
+            tk.Label(self.acct_list, text=name, fg=fg).grid(row=i, column=0, sticky="w")
+            tk.Label(self.acct_list, text=sub, fg="gray40").grid(row=i, column=1, sticky="w", padx=(0, 8))
+            tk.Label(self.acct_list, text=status, fg="dark green" if "ok" in status or active else
+                     "firebrick" if "scaduto" in status else "gray40").grid(row=i, column=2, sticky="w", padx=(0, 8))
+            tk.Label(self.acct_list, text=org, fg="gray40").grid(row=i, column=3, sticky="w", padx=(0, 8))
+            tk.Label(self.acct_list, text=last, fg="gray40").grid(row=i, column=4, sticky="w", padx=(0, 8))
+            if err:
+                tk.Label(self.acct_list, text=err, fg="firebrick").grid(row=i, column=5, sticky="w")
+
+    def acct_save(self):
+        name = self.acct_name.get().strip()
+        if not name:
+            self.acct_msg.configure(text="Scrivi un nome nel campo in basso.")
+            return
+        def work():
+            try:
+                sub, org = ug.save_account(name)
+                self.acct_msg.configure(text=f"Salvata '{name}' ({sub}, org {org[:8]}...)")
+            except ug.PollError as e:
+                self.acct_msg.configure(text=str(e))
+            self.acct_shown = None
+        threading.Thread(target=work, daemon=True).start()
+
+    def acct_remove(self):
+        name = self.acct_name.get().strip()
+        if not name:
+            self.acct_msg.configure(text="Scrivi il nome da rimuovere.")
+            return
+        try:
+            ug.remove_account(name)
+            self.acct_msg.configure(text=f"Rimossa '{name}'.")
+        except ug.PollError as e:
+            self.acct_msg.configure(text=str(e))
+        self.acct_shown = None
+
+    def acct_switch(self):
+        name = self.acct_name.get().strip()
+        if not name:
+            self.acct_msg.configure(text="Scrivi il nome a cui fare switch.")
+            return
+        def work():
+            try:
+                org = ug.switch_account(name)
+                self.acct_msg.configure(text=f"Switch a '{name}' (org {org[:8]}...): le sessioni cambiano alla prossima chiamata.")
+            except ug.PollError as e:
+                self.acct_msg.configure(text=str(e))
+            self.acct_shown = None
+        threading.Thread(target=work, daemon=True).start()
+
+    def acct_refresh(self):
+        name = self.acct_name.get().strip()
+        if not name:
+            self.acct_msg.configure(text="Scrivi il nome da refreshare.")
+            return
+        def work():
+            try:
+                exp = ug.refresh_account(name)
+                self.acct_msg.configure(text=f"Refreshata '{name}': scade alle {ug.fmt_epoch(exp // 1000)}.")
+            except ug.PollError as e:
+                self.acct_msg.configure(text=str(e))
+            self.acct_shown = None
+        threading.Thread(target=work, daemon=True).start()
 
     def update_tab(self, nb):
         box = tk.Frame(nb, padx=10, pady=6)
@@ -1140,6 +1266,9 @@ class Widget:
                 label, ok = self.update_action()  # il controllo e' in un thread: il pulsante segue al tick
                 self.update_button.configure(text=label, state="normal" if ok else "disabled")
             self.draw_sessions()
+            self.draw_accounts()
+            ug.auto_refresh_accounts()
+            ug.poll_accounts()
             for name in ug.PROVIDERS:
                 pc = self.cfg[name]
                 if pc["enabled"]:
@@ -1223,6 +1352,21 @@ class Widget:
                 segs, b = self.row(name, now)
                 rows.append(segs)
                 blocked |= b
+        # righe delle utenze aggiuntive
+        acct_state = self.state.get("accounts") or {}
+        for name in sorted(ug.list_accounts()):
+            ast_ = acct_state.get(name, {})
+            segs = [(name, DIM, True)]
+            for label, pct, _reset in ast_.get("windows") or []:
+                segs.append((f"{short(label, names) if label != ug.SPEND else label} {pct}%", FG, True))
+            if ast_.get("credits"):
+                credits = re.sub(r"\.\d+|\(.*\)", "", ast_["credits"])
+                segs.append((credits, DIM, False))
+            if ast_.get("err"):
+                segs.append((ast_["err"][:40], WARN, False))
+            if len(segs) == 1:
+                segs.append(("attesa del primo poll", DIM, False))
+            rows.append(segs)
         if not rows:
             rows.append([("nessun provider attivo: tasto destro, Impostazioni", DIM, False)])
         if self.update_tag:
