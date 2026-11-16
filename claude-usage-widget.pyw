@@ -130,6 +130,7 @@ def short(label, names):
 
 # --- piattaforma: Win32 o macOS/Linux -------------------------------------------
 UPDATE_EVERY = 600  # s fra due controlli dal widget; in rete si va solo ogni update.interval_h ore
+BG_EVERY = 30  # s fra due giri del thread delle utenze; la rete la decide account_cycle (ogni interval)
 UPDATE_MARK = "⚠"  # aggiornamento disponibile: tasto destro, Aggiorna a vX
 
 if IS_WIN:
@@ -251,6 +252,7 @@ class Widget:
         self.update_label, self.update_button, self.installed_tag, self.closed = None, None, None, False
         self.update_nb, self.update_tab_id = None, None
         self.acct_list, self.acct_shown, self.acct_name, self.acct_msg = None, None, None, None
+        self.bg_running, self.bg_last, self.trim_last = False, 0, 0  # trim_last 0: il log si taglia subito
         # scheda Sessioni: il thread d'invio scrive solo sess_msg e sess_busy
         self.sess_list, self.sess_shown, self.sess_sel, self.sess_by_key = None, None, set(), {}
         self.sess_msg, self.sess_busy, self.sess_buttons, self.sess_result = "", False, [], None
@@ -754,19 +756,17 @@ class Widget:
         if not (self.acct_list and self.win and self.win.winfo_exists() and self.acct_list.winfo_exists()):
             return
         accounts = sorted(ug.list_accounts().items())
-        # l'utenza attiva: la si riconosce dall'org
-        try:
-            active_org = json.loads(ug.read_text(ug.CREDENTIALS)).get("organizationUuid")
-        except (OSError, ValueError):
-            active_org = None
+        active_org = ug.active_org()  # l'utenza attiva: la si riconosce dall'org
         acct_state = self.state.get("accounts") or {}
         rows = []
         for name, info in accounts:
             exp = info.get("expiresAt", 0) // 1000
             ast_ = acct_state.get(name, {})
-            is_active = info.get("organizationUuid") and info["organizationUuid"] == active_org
-            status = ("attiva" if is_active else "scaduto" if exp and exp <= time.time()
-                      else f"ok ({fmt_left(exp - time.time())})" if exp else "?")
+            is_active = bool(info.get("organizationUuid")) and info["organizationUuid"] == active_org
+            # minuti interi: la riga cambia una volta al minuto, non a ogni tick
+            left = int(exp - time.time()) // 60 * 60
+            status = ("attiva" if is_active else "login da rifare" if ast_.get("dead")
+                      else "scaduto" if exp and left <= 0 else f"ok ({ug.fmt_left(left)})" if exp else "?")
             last = ast_.get("last", "")
             err = ast_.get("err", "")
             visible = info.get("visible", True)
@@ -798,7 +798,8 @@ class Widget:
             tk.Label(self.acct_list, text=name, fg=fg).grid(row=i, column=1, sticky="w")
             tk.Label(self.acct_list, text=sub, fg="gray40").grid(row=i, column=2, sticky="w", padx=(0, 8))
             tk.Label(self.acct_list, text=status, fg="dark green" if "ok" in status or active else
-                     "firebrick" if "scaduto" in status else "gray40").grid(row=i, column=3, sticky="w", padx=(0, 8))
+                     "firebrick" if "scaduto" in status or "login" in status else "gray40").grid(
+                row=i, column=3, sticky="w", padx=(0, 8))
             tk.Label(self.acct_list, text=org, fg="gray40").grid(row=i, column=4, sticky="w", padx=(0, 8))
             tk.Label(self.acct_list, text=last, fg="gray40").grid(row=i, column=5, sticky="w", padx=(0, 8))
             if err:
@@ -1208,7 +1209,8 @@ class Widget:
         aspetta la fine di blocchi e pause: dopo, il widget si riavvia."""
         mode = ug.update_config(self.cfg)["mode"]
         if mode == "off":
-            self.update_tag = None
+            # nessun controllo automatico, ma quello fatto con "Controlla ora" resta: prima lo si
+            # cancellava al tick dopo e Aggiorna tornava grigio dopo 2 s
             return
         if self.update_busy or now - self.update_last < UPDATE_EVERY:
             return
@@ -1286,6 +1288,27 @@ class Widget:
             parts.append(f"errore: {st['err']}")
         return "\n".join(parts)
 
+    def background_tick(self, now):
+        """Ogni BG_EVERY s, in un thread: refresh e poll delle utenze (account_cycle decide chi tocca
+        la rete) e, una volta l'ora, il taglio del log. Un giro alla volta."""
+        if self.bg_running or now - self.bg_last < BG_EVERY:
+            return
+        self.bg_running, self.bg_last = True, now
+        trim = now - self.trim_last >= 3600
+        if trim:
+            self.trim_last = now
+
+        def work():
+            try:
+                if trim:
+                    ug.trim_log()
+                ug.account_cycle()
+            except Exception as e:  # noqa: BLE001  il thread non deve morire in silenzio
+                ug.log("widget", f"ERRORE utenze: {type(e).__name__}: {e}")
+            finally:
+                self.bg_running, self.state_mtime = False, None
+        threading.Thread(target=work, daemon=True).start()
+
     def tick(self):
         # Il prossimo tick si programma comunque: un'eccezione qui congelava la riga
         # sull'ultimo valore, coi poll da menu che continuavano senza che si vedesse.
@@ -1308,8 +1331,7 @@ class Widget:
                     pass
             self.draw_sessions()
             self.draw_accounts()
-            ug.auto_refresh_accounts()
-            ug.poll_accounts()
+            self.background_tick(now)  # utenze e log: in un thread, mai nel thread di Tk
             for name in ug.PROVIDERS:
                 pc = self.cfg[name]
                 if pc["enabled"]:
@@ -1396,11 +1418,18 @@ class Widget:
                 blocked |= b
         # righe delle utenze aggiuntive (solo quelle con visible=true)
         acct_state = self.state.get("accounts") or {}
+        names = LABELS[self.p["labels"]]
         for name, info in sorted(ug.list_accounts().items()):
             if not info.get("visible", True):
                 continue
             ast_ = acct_state.get(name, {})
             segs = [(name, DIM, True)]
+            if ast_.get("active"):
+                continue  # in uso da Claude Code: la riga Claude e' gia' la sua
+            if ast_.get("dead"):
+                segs.append(("login da rifare", WARN, True))
+                rows.append(segs)
+                continue
             for label, pct, _reset in ast_.get("windows") or []:
                 segs.append((f"{short(label, names) if label != ug.SPEND else label} {pct}%", FG, True))
             if ast_.get("credits"):

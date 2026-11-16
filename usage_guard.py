@@ -199,6 +199,14 @@ class PollError(Exception):
     pass
 
 
+class LoginNeeded(PollError):
+    """Il refresh token non vale piu': serve un nuovo claude /login e --save-account."""
+
+
+class RateLimited(PollError):
+    """HTTP 429: si aspetta prima di richiamare."""
+
+
 class Busy(Exception):
     pass
 
@@ -1740,16 +1748,29 @@ def account_path(name):
     return os.path.join(ACCOUNTS_DIR, f"{name}.json")
 
 
+_acct_cache = {}  # nome -> (mtime_ns, info): il widget chiede la lista a ogni disegno, il file cambia di rado
+
+
 def list_accounts():
-    """Le utenze aggiuntive configurate, {nome: {subscriptionType, organizationUuid, expiresAt, ...}}."""
+    """Le utenze aggiuntive configurate, {nome: {subscriptionType, organizationUuid, expiresAt, ...}}.
+    Ogni file si rilegge solo se e' cambiato."""
     out = {}
     try:
         for f in os.listdir(ACCOUNTS_DIR):
             if not f.endswith(".json"):
                 continue
             name = f[:-5]
+            path = os.path.join(ACCOUNTS_DIR, f)
             try:
-                data = json.loads(read_text(os.path.join(ACCOUNTS_DIR, f)))
+                mtime = os.stat(path).st_mtime_ns
+            except OSError:
+                continue
+            hit = _acct_cache.get(name)
+            if hit and hit[0] == mtime:
+                out[name] = dict(hit[1])
+                continue
+            try:
+                data = json.loads(read_text(path))
                 o = data.get("claudeAiOauth") or {}
                 out[name] = {
                     "subscriptionType": o.get("subscriptionType") or "?",
@@ -1761,10 +1782,13 @@ def list_accounts():
                     "hasRefresh": bool(o.get("refreshToken")),
                     "visible": data.get("visible", True),  # nel widget: riga visibile o nascosta
                 }
+                _acct_cache[name] = (mtime, dict(out[name]))
             except (OSError, ValueError):
                 out[name] = {"err": "file illeggibile"}
     except FileNotFoundError:
         pass
+    for gone in set(_acct_cache) - set(out):
+        _acct_cache.pop(gone, None)
     return out
 
 
@@ -1825,10 +1849,10 @@ def refresh_account(name):
     Non tocca mai .credentials.json: quello lo fa solo switch. Ritorna il nuovo expiresAt (ms)."""
     cred, o = load_account_cred(name)
     if not o.get("refreshToken"):
-        raise PollError(f"utenza '{name}' senza refresh token: rifai --save-account")
+        raise LoginNeeded(f"utenza '{name}' senza refresh token")
     rt_exp = to_int(o.get("refreshTokenExpiresAt")) // 1000
     if rt_exp and rt_exp <= now():
-        raise PollError(f"utenza '{name}': refresh token scaduto ({fmt_epoch(rt_exp)}): rifai --save-account")
+        raise LoginNeeded(f"utenza '{name}': refresh token scaduto ({fmt_epoch(rt_exp)})")
     data = json.dumps({
         "grant_type": "refresh_token",
         "refresh_token": o["refreshToken"],
@@ -1841,9 +1865,15 @@ def refresh_account(name):
         with urllib.request.urlopen(req, timeout=30, context=tls_context()) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
+        if e.code in (400, 401):
+            # invalid_grant: il refresh token e' stato ruotato da altri (Claude Code loggato su questa
+            # utenza) o revocato. Riprovare non serve: serve un nuovo --save-account
+            raise LoginNeeded(f"refresh di '{name}': HTTP {e.code}, token non piu' valido")
         raise PollError(f"refresh di '{name}': HTTP {e.code}")
-    except (urllib.error.URLError, OSError) as e:
-        raise PollError(f"refresh di '{name}': {getattr(e, 'reason', e)}")
+    except Exception as e:  # noqa: BLE001  rete, TLS, risposta non JSON: mai fuori come eccezione grezza
+        raise PollError(f"refresh di '{name}': {type(e).__name__}: {getattr(e, 'reason', e)}")
+    if not isinstance(body, dict):
+        raise PollError(f"refresh di '{name}': risposta senza oggetto JSON")
     for key in ("access_token", "refresh_token"):
         if key not in body:
             raise PollError(f"refresh di '{name}': la risposta non ha '{key}'")
@@ -1877,7 +1907,15 @@ def switch_account(name):
             if info.get("organizationUuid") == old_org and n != name:
                 old_name = n
                 break
+    if old_cred and not old_name and (old_cred.get("claudeAiOauth") or {}).get("refreshToken"):
+        # l'utenza attiva non era mai stata salvata (di solito la principale): senza questo, lo switch
+        # ne butterebbe via i token e servirebbe un nuovo login per tornarci
+        old_name = "principale"
+        n = 2
+        while os.path.isfile(account_path(old_name)):
+            old_name, n = f"principale-{n}", n + 1
     if old_cred and old_name:
+        os.makedirs(ACCOUNTS_DIR, exist_ok=True)
         write_atomic(account_path(old_name), json.dumps(old_cred, indent=2) + "\n")
         log("account", f"utenza attiva '{old_name}' (org {old_org[:8]}...) salvata nel suo file")
     write_atomic(CREDENTIALS, json.dumps(new_cred, indent=2) + "\n")
@@ -1898,43 +1936,100 @@ def read_account_usage(name):
         with urllib.request.urlopen(req, timeout=API_TIMEOUT, context=tls_context()) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise RateLimited(f"utenza '{name}': troppe richieste (429)")
         raise PollError({401: f"utenza '{name}': token revocato (401)",
-                         403: f"utenza '{name}': senza permesso (403)",
-                         429: f"utenza '{name}': troppe richieste (429)"}.get(e.code, f"utenza '{name}': HTTP {e.code}"))
-    except (urllib.error.URLError, OSError) as e:
-        raise PollError(f"utenza '{name}' non raggiungibile: {getattr(e, 'reason', e)}")
+                         403: f"utenza '{name}': senza permesso (403)"}.get(e.code, f"utenza '{name}': HTTP {e.code}"))
+    except Exception as e:  # noqa: BLE001  rete, TLS, pagina non JSON (es. Cloudflare): un PollError e basta
+        raise PollError(f"utenza '{name}' non letta: {type(e).__name__}: {getattr(e, 'reason', e)}")
     if not isinstance(body, dict):
         raise PollError(f"utenza '{name}': risposta senza oggetto JSON")
     return usage_from_body(body)
 
 
-def auto_refresh_accounts():
-    """Refresha le utenze il cui token scade entro REFRESH_INTERVAL. Chiamata dal widget e dal loop."""
+def active_org():
+    """L'org dell'utenza con cui Claude Code e' loggato adesso, o ""."""
+    try:
+        return json.loads(read_text(CREDENTIALS)).get("organizationUuid") or ""
+    except (OSError, ValueError):
+        return ""
+
+
+def account_cycle(interval_s=None, force=False):
+    """Refresh e poll delle utenze aggiuntive, ognuna al suo ritmo: lo si puo' chiamare spesso, fa
+    rete solo quando serve. Gira in un thread del widget o nel loop, mai nel thread di Tk: una
+    chiamata puo' durare 15-30 s (il 2026-11-12/16 il widget la faceva a ogni tick, si bloccava
+    e prendeva 24 mila 429).
+    - l'utenza attiva in Claude Code si salta: il suo token lo ruota Claude Code, un refresh da qui
+      lo farebbe morire a uno dei due; la riga Claude del widget e' gia' la sua
+    - refresh HTTP 400/401: login da rifare, lo si scrive una volta e ci si ferma finche' il file
+      dell'utenza non cambia (un nuovo Salva)
+    - 429: pausa di 5 minuti per quell'utenza
+    - un errore si scrive nel log solo quando cambia"""
+    if interval_s is None:
+        interval_s = max(60, to_int(load_config()["claude"].get("interval")) or 300)
+    try:
+        with dir_lock(os.path.join(DIR, "usage-guard.accounts.lock"), stale=120, wait=0):
+            _account_cycle(interval_s, force)
+    except Busy:
+        return  # widget e loop insieme: uno alla volta
+
+
+def _account_cycle(interval_s, force):
+    active = active_org()
+    st_all = load_state().get("accounts") or {}
     for name, info in list_accounts().items():
-        if not info.get("hasRefresh"):
+        st = st_all.get(name) or {}
+        try:
+            mtime = os.stat(account_path(name)).st_mtime_ns
+        except OSError:
             continue
+        if info.get("organizationUuid") and info["organizationUuid"] == active:
+            if not st.get("active"):
+                update_state("accounts", **{name: {"active": True, "err": "", "dead": 0}})
+            continue
+        if st.get("dead") and st.get("dead") == mtime:
+            continue  # login da rifare, file invariato: niente rete
+        fields = {"active": False}
+        if st.get("dead") and st.get("dead") != mtime:
+            fields.update(dead=0, err="")  # risalvata: si riparte
+            log("account", f"utenza '{name}' salvata di nuovo, riprendo refresh e poll")
+        t = now()
+        # refresh: se il token scade entro REFRESH_INTERVAL; dopo un errore di rete, fra 10 minuti
         exp = info.get("expiresAt", 0) // 1000
-        if exp and exp - now() < REFRESH_INTERVAL:
+        if info.get("hasRefresh") and (not exp or exp - t < REFRESH_INTERVAL) and t >= to_int(st.get("refresh_retry")):
             try:
                 refresh_account(name)
+                mtime = os.stat(account_path(name)).st_mtime_ns
+                fields["refresh_retry"] = 0
+            except LoginNeeded as e:
+                fields.update(dead=mtime, err=f"login da rifare: {e}", windows=[])
+                log("account", f"ERRORE '{name}': {e}. Fermo refresh e poll: rifai claude /login e Salva")
+                update_state("accounts", **{name: {**st, **fields}})
+                continue
             except PollError as e:
-                log("account", f"ERRORE refresh di '{name}': {e}")
-
-
-def poll_accounts():
-    """Legge l'uso di ogni utenza aggiuntiva e lo mette nello state, sotto accounts.<nome>."""
-    for name in list_accounts():
-        try:
-            r = read_account_usage(name)
-            update_state("accounts", **{name: {
-                "windows": r["windows"], "credits": r.get("credits", ""), "mode": r["mode"],
-                "note": r.get("note", ""), "poll_epoch": now(), "err": "",
-                "last": f"{stamp()} " + " ".join(f"{w[0]}={w[1]}%" for w in r["windows"])
-                         + (f" credits={r['credits']}" if r.get("credits") else ""),
-            }})
-        except PollError as e:
-            update_state("accounts", **{name: {"err": str(e), "poll_epoch": now()}})
-            log("account", f"ERRORE poll '{name}': {e}")
+                fields["refresh_retry"] = t + 600
+                if str(e) != st.get("err"):
+                    log("account", f"ERRORE refresh di '{name}': {e} (riprovo fra 10 minuti)")
+                fields["err"] = str(e)
+        # poll: ogni interval_s, salvo pausa dopo un 429
+        due = force or t - to_int(st.get("poll_epoch")) >= interval_s
+        if due and t >= to_int(st.get("backoff")):
+            try:
+                r = read_account_usage(name)
+                fields.update(windows=r["windows"], credits=r.get("credits", ""), mode=r["mode"],
+                              note=r.get("note", ""), poll_epoch=t, err="", backoff=0,
+                              last=f"{stamp()} " + " ".join(f"{w[0]}={w[1]}%" for w in r["windows"])
+                              + (f" credits={r['credits']}" if r.get("credits") else ""))
+            except RateLimited as e:
+                fields.update(backoff=t + 300, poll_epoch=t, err=str(e))
+                if str(e) != st.get("err"):
+                    log("account", f"ERRORE poll '{name}': {e}, pausa 5 minuti")
+            except PollError as e:
+                fields.update(poll_epoch=t, err=str(e))
+                if str(e) != st.get("err"):
+                    log("account", f"ERRORE poll '{name}': {e}")
+        update_state("accounts", **{name: {**st, **fields}})
 
 
 # --- aggiornamenti ---------------------------------------------------------------
@@ -2190,8 +2285,7 @@ def loop(only):
         on = [n for n in only if cfg[n]["enabled"]]
         for name in on:
             poll(name)
-        auto_refresh_accounts()
-        poll_accounts()
+        account_cycle()  # fa rete solo per le utenze in scadenza o col poll dovuto
         # Si dorme fino al primo provider in scadenza: se il widget fa il poll prima,
         # al risveglio lo state e' fresco e il turno salta
         st, t = load_state(), now()
