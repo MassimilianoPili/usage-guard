@@ -16,8 +16,6 @@ controllare. Preferenze del widget in ~/.claude/usage-guard.widget, dei
 provider in ~/.claude/usage-guard.json.
 """
 import contextlib
-import ctypes
-import ctypes.wintypes as wintypes
 import json
 import os
 import re
@@ -32,6 +30,13 @@ from tkinter import ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import usage_guard as ug  # noqa: E402
+
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+
+if IS_WIN:
+    import ctypes
+    import ctypes.wintypes as wintypes
 
 PREFS = os.path.join(ug.DIR, "usage-guard.widget")
 SESSION_SECONDS = 5 * 3600  # la finestra di sessione di Claude: five_hour nella risposta dell'API
@@ -123,63 +128,77 @@ def short(label, names):
     return label
 
 
-class MONITORINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
-                ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
-
-
-U32 = ctypes.windll.user32
-U32.MonitorFromPoint.restype = ctypes.c_void_p
-U32.MonitorFromPoint.argtypes = [wintypes.POINT, ctypes.c_uint]
-U32.MonitorFromRect.restype = ctypes.c_void_p
-U32.MonitorFromRect.argtypes = [ctypes.POINTER(wintypes.RECT), ctypes.c_uint]
-U32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
-U32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
-U32.GetParent.restype = ctypes.c_void_p
-U32.GetParent.argtypes = [ctypes.c_void_p]
-U32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
-U32.GetForegroundWindow.restype = ctypes.c_void_p
-U32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
-U32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
-U32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
-U32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_int] * 4 + [ctypes.c_uint]
-TASKBARS = ("Shell_TrayWnd", "Shell_SecondaryTrayWnd")
-K32 = ctypes.WinDLL("kernel32", use_last_error=True)
-K32.CreateMutexW.restype = K32.CreateEventW.restype = ctypes.c_void_p
-K32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-K32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
-K32.SetEvent.argtypes = [ctypes.c_void_p]
-K32.WaitForSingleObject.argtypes = [ctypes.c_void_p, wintypes.DWORD]
-K32.OpenProcess.restype = ctypes.c_void_p
-K32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-K32.CloseHandle.argtypes = [ctypes.c_void_p]
+# --- piattaforma: Win32 o macOS/Linux -------------------------------------------
 UPDATE_EVERY = 600  # s fra due controlli dal widget; in rete si va solo ogni update.interval_h ore
 UPDATE_MARK = "⚠"  # aggiornamento disponibile: tasto destro, Aggiorna a vX
 
+if IS_WIN:
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+    U32 = ctypes.windll.user32
+    U32.MonitorFromPoint.restype = ctypes.c_void_p
+    U32.MonitorFromPoint.argtypes = [wintypes.POINT, ctypes.c_uint]
+    U32.MonitorFromRect.restype = ctypes.c_void_p
+    U32.MonitorFromRect.argtypes = [ctypes.POINTER(wintypes.RECT), ctypes.c_uint]
+    U32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    U32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+    U32.GetParent.restype = ctypes.c_void_p
+    U32.GetParent.argtypes = [ctypes.c_void_p]
+    U32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    U32.GetForegroundWindow.restype = ctypes.c_void_p
+    U32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+    U32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    U32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    U32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_int] * 4 + [ctypes.c_uint]
+    TASKBARS = ("Shell_TrayWnd", "Shell_SecondaryTrayWnd")
+    K32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    K32.CreateMutexW.restype = K32.CreateEventW.restype = ctypes.c_void_p
+    K32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    K32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+    K32.SetEvent.argtypes = [ctypes.c_void_p]
+    K32.WaitForSingleObject.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    K32.OpenProcess.restype = ctypes.c_void_p
+    K32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    K32.CloseHandle.argtypes = [ctypes.c_void_p]
+
 
 def monitor_rect(x, y):
-    """Rettangolo intero del monitor piu' vicino a (x, y), barra delle applicazioni
-    compresa: un monitor staccato da quando e' stata salvata la posizione non vale."""
-    mi = MONITORINFO()
-    mi.cbSize = ctypes.sizeof(mi)
-    mon = U32.MonitorFromPoint(wintypes.POINT(x, y), 2)  # MONITOR_DEFAULTTONEAREST
-    if mon and U32.GetMonitorInfoW(mon, ctypes.byref(mi)):
-        r = mi.rcMonitor
-        return r.left, r.top, r.right, r.bottom
-    return 0, 0, U32.GetSystemMetrics(0), U32.GetSystemMetrics(1)
+    """Rettangolo intero del monitor piu' vicino a (x, y)."""
+    if IS_WIN:
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(mi)
+        mon = U32.MonitorFromPoint(wintypes.POINT(x, y), 2)
+        if mon and U32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+            r = mi.rcMonitor
+            return r.left, r.top, r.right, r.bottom
+        return 0, 0, U32.GetSystemMetrics(0), U32.GetSystemMetrics(1)
+    # macOS/Linux: tkinter non espone i singoli monitor. Si prende lo schermo intero.
+    # Con pyobjc su macOS si potrebbe usare NSScreen, ma non e' un requisito minimo.
+    try:
+        root = tk._default_root  # noqa: SLF001
+        return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+    except (AttributeError, tk.TclError):
+        return 0, 0, 1920, 1080
 
 
 def attached(x, y, w, h):
     """Vero se almeno un pezzo del widget sta su un monitor attaccato."""
-    rect = wintypes.RECT(x, y, x + w, y + h)
-    return bool(U32.MonitorFromRect(ctypes.byref(rect), 0))  # MONITOR_DEFAULTTONULL
+    if IS_WIN:
+        rect = wintypes.RECT(x, y, x + w, y + h)
+        return bool(U32.MonitorFromRect(ctypes.byref(rect), 0))
+    return True  # su macOS/Linux senza pyobjc si assume sempre attaccato
 
 
 def mouse_corner():
     """Alto a destra del monitor col mouse, stesso offset del primo avvio."""
-    pt = wintypes.POINT()
-    U32.GetCursorPos(ctypes.byref(pt))
-    _l, t, r, _b = monitor_rect(pt.x, pt.y)
+    if IS_WIN:
+        pt = wintypes.POINT()
+        U32.GetCursorPos(ctypes.byref(pt))
+        _l, t, r, _b = monitor_rect(pt.x, pt.y)
+        return r - 420, t + 8
+    _l, t, r, _b = monitor_rect(0, 0)
     return r - 420, t + 8
 
 
@@ -197,9 +216,9 @@ def dock_point(p, l, t, r, b):
 
 
 def foreground_blocks_raise(own):
-    """Vero se in primo piano c'e' una finestra topmost che non va coperta: Start,
-    calendario, impostazioni rapide, un altro programma sempre in primo piano, o la
-    finestra Impostazioni. La barra e il widget stesso (own) invece no."""
+    """Vero se in primo piano c'e' una finestra topmost che non va coperta."""
+    if not IS_WIN:
+        return False  # su macOS/Linux la gestione z-order e' di tkinter
     fg = U32.GetForegroundWindow()
     if not fg or fg in own:
         return False
@@ -241,7 +260,8 @@ class Widget:
             win.overrideredirect(True)
             self.bind(win)  # sulla toplevel vale anche per frame e label (bindtags)
         top.configure(bg=KEY)
-        top.attributes("-transparentcolor", KEY)
+        if IS_WIN:
+            top.attributes("-transparentcolor", KEY)
         root.report_callback_exception = self.crash
         self.frame = tk.Frame(top, bg=KEY)  # padding da apply()
         self.frame.pack()
@@ -254,7 +274,8 @@ class Widget:
         self.menu.add_command(label="Aggiorna", command=self.update_now)
         self.update_index = self.menu.index("end")
         self.autostart = tk.BooleanVar(value=os.path.isfile(STARTUP_LNK))
-        self.menu.add_checkbutton(label="Avvia con Windows", variable=self.autostart, command=self.toggle_autostart)
+        self.menu.add_checkbutton(label="Avvia con il sistema" if IS_MAC else "Avvia con Windows",
+                                  variable=self.autostart, command=self.toggle_autostart)
         self.menu.add_separator()
         self.menu.add_command(label="Chiudi", command=root.destroy)
         self.reload()
@@ -263,10 +284,11 @@ class Widget:
         self.place()
         root.update()
         # sfondo prima, testo dopo: nello z-order il testo resta sopra
-        self.hwnds = (U32.GetParent(root.winfo_id()), U32.GetParent(top.winfo_id()))
-        # Il testo ha per owner lo sfondo: Windows lo tiene sempre sopra, anche
-        # quando un clic attiva lo sfondo. Tk non lo fa per le overrideredirect.
-        U32.SetWindowLongPtrW(self.hwnds[1], -8, self.hwnds[0])  # GWLP_HWNDPARENT
+        if IS_WIN:
+            self.hwnds = (U32.GetParent(root.winfo_id()), U32.GetParent(top.winfo_id()))
+            U32.SetWindowLongPtrW(self.hwnds[1], -8, self.hwnds[0])  # GWLP_HWNDPARENT
+        else:
+            self.hwnds = ()
         if not self.cfg.get("setup_done"):
             root.after(300, lambda: self.settings(first=True))
         self.tick()
@@ -341,11 +363,11 @@ class Widget:
     def keep_on_top(self):
         # La barra delle applicazioni e' topmost anche lei: cliccata, passa sopra
         # al widget appoggiato su di essa. SWP_NOACTIVATE: niente furto di focus.
-        # Col menu aperto no: il widget gli passerebbe sopra.
         try:
-            if self.p["topmost"] and not self.menu_open and not foreground_blocks_raise(self.hwnds):
+            if IS_WIN and self.p["topmost"] and not self.menu_open and not foreground_blocks_raise(self.hwnds):
                 for hwnd in self.hwnds:
                     U32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x13)  # HWND_TOPMOST; NOSIZE|NOMOVE|NOACTIVATE
+            # su macOS/Linux: -topmost di tkinter basta, nessuna chiamata extra
         finally:
             self.root.after(500, self.keep_on_top)
 
@@ -1299,7 +1321,8 @@ class Widget:
                 if now - last >= ug.interval(name, pc, self.state.get(name, {})):
                     self.run(name)
             self.render(now)
-            if K32.WaitForSingleObject(self.show, 0) == 0:  # WAIT_OBJECT_0: script rilanciato
+            if self.show and (IS_WIN and K32.WaitForSingleObject(self.show, 0) == 0 or
+                              not IS_WIN and _unix_check_show()):  # script rilanciato
                 # sul monitor del mouse: libero in alto a destra, agganciato allo stesso punto
                 if self.p["dock"] == "free":
                     self.topleft = mouse_corner()
@@ -1411,61 +1434,143 @@ class Widget:
         self.draw_layout()  # e il disegno delle Impostazioni le righe vere
 
 
-STARTUP_LNK = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs",
-                           "Startup", "Claude usage guard.lnk")
+# --- avvio con il sistema --------------------------------------------------------
+if IS_WIN:
+    STARTUP_LNK = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs",
+                               "Startup", "Claude usage guard.lnk")
+elif IS_MAC:
+    STARTUP_LNK = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents",
+                               "com.usage-guard.widget.plist")
+else:
+    STARTUP_LNK = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"),
+                               "autostart", "claude-usage-guard.desktop")
 
 
 def set_autostart(on):
-    """Collegamento in Esecuzione automatica: pythonw + questo widget, niente console."""
+    """Esecuzione automatica al login: .lnk su Windows, launchd plist su macOS, .desktop su Linux."""
     if not on:
         with contextlib.suppress(FileNotFoundError):
             os.remove(STARTUP_LNK)
         return
     here = os.path.dirname(os.path.abspath(__file__))
-    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    # I percorsi passano per l'ambiente: con spazi e apostrofi un -Command quotato a mano si rompe
-    env = dict(os.environ, UG_LNK=STARTUP_LNK, UG_EXE=pyw, UG_DIR=here,
-               UG_ARGS=f'"{os.path.join(here, os.path.basename(__file__))}"')
-    script = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:UG_LNK); "
-              "$s.TargetPath = $env:UG_EXE; $s.Arguments = $env:UG_ARGS; $s.WorkingDirectory = $env:UG_DIR; "
-              "$s.Description = 'Claude usage guard'; $s.Save()")
-    p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], env=env,
-                       capture_output=True, text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
-    if p.returncode or not os.path.isfile(STARTUP_LNK):
-        raise RuntimeError(f"collegamento non creato: {(p.stderr or p.stdout).strip()[:200]}")
+    widget = os.path.join(here, os.path.basename(__file__))
+    if IS_WIN:
+        pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        env = dict(os.environ, UG_LNK=STARTUP_LNK, UG_EXE=pyw, UG_DIR=here,
+                   UG_ARGS=f'"{widget}"')
+        script = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:UG_LNK); "
+                  "$s.TargetPath = $env:UG_EXE; $s.Arguments = $env:UG_ARGS; $s.WorkingDirectory = $env:UG_DIR; "
+                  "$s.Description = 'Claude usage guard'; $s.Save()")
+        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], env=env,
+                           capture_output=True, text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+        if p.returncode or not os.path.isfile(STARTUP_LNK):
+            raise RuntimeError(f"collegamento non creato: {(p.stderr or p.stdout).strip()[:200]}")
+    elif IS_MAC:
+        # launchd plist: RunAtLoad, KeepAlive false (il widget gira finche' e' aperto)
+        plist = (f'<?xml version="1.0" encoding="UTF-8"?>\n'
+                 f'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                 f'<plist version="1.0"><dict>\n'
+                 f'  <key>Label</key><string>com.usage-guard.widget</string>\n'
+                 f'  <key>ProgramArguments</key><array>\n'
+                 f'    <string>{sys.executable}</string><string>{widget}</string>\n'
+                 f'  </array>\n'
+                 f'  <key>RunAtLoad</key><true/>\n'
+                 f'  <key>WorkingDirectory</key><string>{here}</string>\n'
+                 f'</dict></plist>\n')
+        os.makedirs(os.path.dirname(STARTUP_LNK), exist_ok=True)
+        with open(STARTUP_LNK, "w", encoding="utf-8") as f:
+            f.write(plist)
+    else:
+        # freedesktop .desktop entry
+        desktop = (f"[Desktop Entry]\nType=Application\nName=Claude usage guard\n"
+                   f"Exec={sys.executable} {widget}\nPath={here}\nX-GNOME-Autostart-enabled=true\n")
+        os.makedirs(os.path.dirname(STARTUP_LNK), exist_ok=True)
+        with open(STARTUP_LNK, "w", encoding="utf-8") as f:
+            f.write(desktop)
+
+
+# --- istanza unica e PID file ---------------------------------------------------
+_PIDFILE = os.path.join(ug.DIR, "usage-guard-widget.pid")
+_unix_show_flag = False
+
+
+def _unix_check_show():
+    global _unix_show_flag
+    if _unix_show_flag:
+        _unix_show_flag = False
+        return True
+    return False
 
 
 def single_instance():
-    mutex = K32.CreateMutexW(None, False, "Local\\claude-usage-guard-widget")
-    running = ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS, letto prima di CreateEventW
-    show = K32.CreateEventW(None, False, False, "Local\\claude-usage-guard-widget-show")
-    if running:
-        K32.SetEvent(show)  # il widget aperto viene sul monitor del mouse
-        sys.exit(0)
-    return mutex, show  # tenuti fino all'uscita
+    if IS_WIN:
+        mutex = K32.CreateMutexW(None, False, "Local\\claude-usage-guard-widget")
+        running = ctypes.get_last_error() == 183
+        show = K32.CreateEventW(None, False, False, "Local\\claude-usage-guard-widget-show")
+        if running:
+            K32.SetEvent(show)
+            sys.exit(0)
+        return mutex, show
+    # macOS/Linux: PID file. Se un altro widget gira, segnala e esce.
+    try:
+        with open(_PIDFILE, encoding="utf-8") as f:
+            old = int(f.read().strip())
+        try:
+            os.kill(old, 0)
+            # vivo: segnala di portarsi in primo piano (SIGUSR1)
+            import signal
+            os.kill(old, signal.SIGUSR1)
+            sys.exit(0)
+        except (ProcessLookupError, PermissionError, ValueError):
+            pass  # morto o non nostro: si prende il file
+    except (FileNotFoundError, ValueError):
+        pass
+    os.makedirs(os.path.dirname(_PIDFILE), exist_ok=True)
+    with open(_PIDFILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+    def _on_show(signum, frame):
+        global _unix_show_flag
+        _unix_show_flag = True
+    import signal
+    signal.signal(signal.SIGUSR1, _on_show)
+    return None, True  # mutex placeholder, show placeholder
 
 
 def wait_exit(pid, timeout_ms=20000):
-    """Dopo un aggiornamento: aspetta l'uscita del widget vecchio, che tiene il mutex."""
-    h = K32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
-    if h:
-        K32.WaitForSingleObject(h, timeout_ms)
-        K32.CloseHandle(h)
+    """Dopo un aggiornamento: aspetta l'uscita del widget vecchio."""
+    if IS_WIN:
+        h = K32.OpenProcess(0x00100000, False, pid)
+        if h:
+            K32.WaitForSingleObject(h, timeout_ms)
+            K32.CloseHandle(h)
+    else:
+        deadline = time.time() + timeout_ms / 1000
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.2)
+            except (ProcessLookupError, PermissionError):
+                break
 
 
 if __name__ == "__main__":
     if "--after" in sys.argv[1:-1]:
         wait_exit(num(sys.argv[sys.argv.index("--after") + 1]))
     _mutex, _show = single_instance()
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # testo nitido sugli schermi scalati
-    except (AttributeError, OSError):
-        pass
+    if IS_WIN:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except (AttributeError, OSError):
+            pass
     try:
         Widget(_show).root.mainloop()
     except Exception:
-        # Prima della finestra non c'e' dove mostrarlo: finisce nel log del guard
         with open(ug.LOG, "a", encoding="utf-8") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " widget: ERRORE "
                     + traceback.format_exc().replace("\n", " | ") + "\n")
         raise
+    finally:
+        if not IS_WIN:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(_PIDFILE)

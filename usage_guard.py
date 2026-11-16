@@ -63,8 +63,6 @@ Config ~/.claude/usage-guard.json, state ~/.claude/usage-guard.state.json,
 log ~/.claude/usage-guard.log.
 """
 import contextlib
-import ctypes
-import ctypes.wintypes as wintypes
 import glob
 import hashlib
 import json
@@ -86,6 +84,13 @@ import zipfile
 from datetime import datetime, timedelta
 from io import BytesIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+
+if IS_WIN:
+    import ctypes
+    import ctypes.wintypes as wintypes
 
 try:
     import truststore  # certificati verificati da Windows, come curl ed Edge
@@ -109,8 +114,14 @@ SESSIONS = os.path.join(DIR, "sessions")  # un <pid>.json per sessione di Claude
 CREDENTIALS = os.path.join(DIR, ".credentials.json")  # token OAuth di Claude Code, solo letto
 ACCOUNTS_DIR = os.path.join(DIR, "usage-guard-accounts")  # un <nome>.json per utenza aggiuntiva
 # La copia installata, quella che si aggiorna da sola; la cartella di sviluppo non si tocca mai
-INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local"),
-                           "usage-guard")
+if IS_WIN:
+    INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local"),
+                               "usage-guard")
+elif IS_MAC:
+    INSTALL_DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "usage-guard")
+else:
+    INSTALL_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share"),
+                               "usage-guard")
 REPO = "MassimilianoPili/usage-guard"
 RELEASES = f"https://github.com/{REPO}/releases"
 ASSET = "usage-guard.zip"  # col suo usage-guard.zip.sha256, li pubblica il workflow sul tag
@@ -141,7 +152,7 @@ CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # il client pubblico di Clau
 REFRESH_INTERVAL = 6 * 3600  # s fra un refresh e l'altro delle utenze non attive: il token dura 8 h
 SOURCES = ("auto", "api", "cli")  # auto: API, se fallisce claude -p /usage
 LEGACY_BLOCK = ("http://127.0.0.1:9",)  # della versione bash: si riconosce e si toglie
-NOWIN = subprocess.CREATE_NO_WINDOW
+NOWIN = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
 
 # I messaggi li legge Claude: in inglese, col tag che il CLAUDE.md riconosce
 PAUSE_TEXT = ("[usage-guard] Claude usage {reason} (pause at {pause}%, lock at {limit}%, window resets {reset}). "
@@ -1101,17 +1112,16 @@ READERS = {"claude": read_claude, "codex": read_codex, "copilot": read_copilot}
 
 
 # --- pausa e ripresa delle chat di Claude ---------------------------------------
-_K32 = ctypes.WinDLL("kernel32")  # istanza propria: i prototipi non toccano quelli del widget
-_K32.OpenProcess.restype = wintypes.HANDLE
-_K32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-_K32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
-_K32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
-_K32.CloseHandle.argtypes = (wintypes.HANDLE,)
+if IS_WIN:
+    _K32 = ctypes.WinDLL("kernel32")  # istanza propria: i prototipi non toccano quelli del widget
+    _K32.OpenProcess.restype = wintypes.HANDLE
+    _K32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    _K32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    _K32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    _K32.CloseHandle.argtypes = (wintypes.HANDLE,)
 
 
-def alive(pid, proc_start):
-    """Il processo pid c'e' ed e' quello partito a proc_start (FILETIME), non un pid riusato.
-    Niente os.kill(pid, 0): su Windows non controlla, termina il processo."""
+def _alive_win(pid, proc_start):
     h = _K32.OpenProcess(0x1000, False, to_int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
     if not h:
         return False
@@ -1124,6 +1134,28 @@ def alive(pid, proc_start):
         return True
     finally:
         _K32.CloseHandle(h)
+
+
+def _alive_unix(pid, proc_start):
+    """macOS/Linux: os.kill(pid, 0) controlla se il processo esiste. proc_start qui e' il FILETIME
+    di Windows, scritto da Claude Code su tutte le piattaforme: lo si confronta se disponibile."""
+    try:
+        os.kill(to_int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # esiste, non e' nostro: lo trattiamo come vivo
+    # Il confronto del tempo di avvio evita i PID riusati. Su macOS si potrebbe leggere da sysctl,
+    # ma Claude Code scrive procStart come FILETIME (100 ns dal 1601), che su Unix non si ha.
+    # Senza confronto: il processo esiste, si assume che sia quello giusto.
+    return True
+
+
+def alive(pid, proc_start):
+    """Il processo pid c'e' ed e' quello partito a proc_start, non un pid riusato."""
+    if IS_WIN:
+        return _alive_win(pid, proc_start)
+    return _alive_unix(pid, proc_start)
 
 
 def local_sessions(kinds=("interactive",)):
@@ -2055,18 +2087,23 @@ def install_release(tag, target=INSTALL_DIR):
 def launch_widget(after=None):
     """Il widget di questa copia. after: il pid di un widget che sta uscendo (riavvio dopo un
     aggiornamento), che il nuovo aspetta prima di prendere il mutex dell'istanza unica."""
-    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     widget = os.path.join(HERE, "claude-usage-widget.pyw")
     if not os.path.isfile(widget):
         raise SystemExit(f"Errore: widget non trovato: {widget}")
-    cmd = [pyw, widget] + (["--after", str(after)] if after else [])
-    # Staccato dalla console e dal job del terminale: sopravvive alla sua chiusura
-    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     io = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-    try:
-        subprocess.Popen(cmd, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, **io)
-    except OSError:
-        subprocess.Popen(cmd, creationflags=flags, **io)
+    if IS_WIN:
+        pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        cmd = [pyw, widget] + (["--after", str(after)] if after else [])
+        # Staccato dalla console e dal job del terminale: sopravvive alla sua chiusura
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        try:
+            subprocess.Popen(cmd, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, **io)
+        except OSError:
+            subprocess.Popen(cmd, creationflags=flags, **io)
+    else:
+        # macOS/Linux: pythonw non esiste, si usa python con start_new_session
+        cmd = [sys.executable, widget] + (["--after", str(after)] if after else [])
+        subprocess.Popen(cmd, start_new_session=True, **io)
     if not after:
         print("Widget avviato: menu e Impostazioni col tasto destro. Se era gia' aperto resta quello.")
 
