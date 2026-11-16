@@ -253,6 +253,8 @@ class Widget:
         self.update_nb, self.update_tab_id = None, None
         self.acct_list, self.acct_shown, self.acct_name, self.acct_msg = None, None, None, None
         self.bg_running, self.bg_last, self.trim_last = False, 0, 0  # trim_last 0: il log si taglia subito
+        self.sched, self.sched_rows, self.sched_status, self.sched_add = None, None, None, None
+        self.sched_msg, self.sched_busy = "", False
         # scheda Sessioni: il thread d'invio scrive solo sess_msg e sess_busy
         self.sess_list, self.sess_shown, self.sess_sel, self.sess_by_key = None, None, set(), {}
         self.sess_msg, self.sess_busy, self.sess_buttons, self.sess_result = "", False, [], None
@@ -506,6 +508,7 @@ class Widget:
         w = self.win = tk.Toplevel(self.root)
         # i disegni, il campo aperto e la tabella delle sessioni erano della finestra chiusa
         self.dock_canvas = self.box_canvas = self.edit_close = self.sess_list = self.acct_list = None
+        self.sched_rows = self.sched_status = None
         self.acct_shown = None
         self.editing = False
         w.withdraw()  # si mostra dopo, gia' al suo posto
@@ -522,7 +525,8 @@ class Widget:
         self.layout_tab(nb)
         tabs = {name: self.provider_tab(nb, name) for name in ug.PROVIDERS}
         nb.insert(tabs["codex"], self.sessions_tab(nb))  # subito dopo Claude
-        nb.insert(tabs["codex"], self.accounts_tab(nb))  # dopo Sessioni, prima di Codex
+        nb.insert(tabs["codex"], self.schedule_tab(nb))  # le finestre pianificate, dopo Sessioni
+        nb.insert(tabs["codex"], self.accounts_tab(nb))  # poi Utenze, prima di Codex
         self.update_tab(nb)
         if first:
             nb.select(tabs["claude"])
@@ -725,6 +729,142 @@ class Widget:
         except (OSError, ug.Busy) as e:
             self.sess_msg = f"registro non cambiato: {e}"
         self.state_mtime = None
+
+    # --- scheda Finestre ---------------------------------------------------------------
+    def schedule_tab(self, nb):
+        """Le finestre pianificate: righe con l'orario d'inizio (5 h ciascuna), il ping che avvia la
+        finestra a quell'ora e la pausa, che tiene le chat in pausa per tutta la riga."""
+        tab = tk.Frame(nb, padx=8, pady=6)
+        nb.add(tab, text="Finestre")
+        s = self.cfg["claude"].get("schedule")
+        s = s if isinstance(s, dict) else {}
+        self.sched = {"days": s.get("days") if s.get("days") in ug.SCHEDULE_DAYS else "weekdays",
+                      "slots": [{"start": x.get("start", ""), "ping": bool(x.get("ping", True)),
+                                 "pause": bool(x.get("pause"))}
+                                for x in (s.get("slots") or [])[:ug.MAX_SLOTS] if isinstance(x, dict)]}
+        days = tk.Frame(tab)
+        days.grid(row=0, column=0, sticky="w")
+        tk.Label(days, text="Giorni").pack(side="left", padx=(0, 6))
+        v = self.bound(tk.StringVar, self.sched["days"], lambda val: self.sched_set(days=val))
+        for value, label in (("weekdays", "Lun-Ven"), ("all", "Tutti i giorni")):
+            tk.Radiobutton(days, text=label, value=value, variable=v).pack(side="left")
+        self.sched_rows = tk.Frame(tab)
+        self.sched_rows.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        bar = tk.Frame(tab)
+        bar.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.sched_add = tk.Button(bar, text="Aggiungi riga", command=self.sched_add_row)
+        self.sched_add.pack(side="left")
+        tk.Button(bar, text="Avvia finestra ora", command=self.sched_ping_now).pack(side="left", padx=(6, 0))
+        self.sched_status = tk.Label(tab, fg="gray40", justify="left")
+        self.sched_status.grid(row=3, column=0, sticky="w", pady=(6, 0))
+        tk.Label(tab, text="Ogni riga dura 5 h, come la finestra di sessione. Ping: all'orario (o al risveglio\n"
+                           "del PC, entro 2 h) una richiesta minima con claude -p e Haiku avvia la finestra;\n"
+                           "niente ping con una finestra gia' aperta o col blocco attivo.\n"
+                           "Pausa: all'inizio della riga le chat al lavoro vanno in pausa (subagent e workflow\n"
+                           "compresi), e il continue aspetta la prima riga di lavoro dopo.\n"
+                           "Nessuna riga: funzione spenta.",
+                 fg="gray40", justify="left").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        self.draw_sched_rows()
+        self.draw_sched_status()
+        return tab
+
+    def sched_set(self, days=None):
+        if days is not None:
+            if days not in ug.SCHEDULE_DAYS:
+                return
+            self.sched["days"] = days
+        self.set_cfg("claude", "schedule", json.loads(json.dumps(self.sched)))  # copia: niente alias con la UI
+        self.draw_sched_status()
+
+    def sched_add_row(self):
+        slots = self.sched["slots"]
+        if len(slots) >= ug.MAX_SLOTS:
+            return
+        # la riga nuova parte dove finisce l'ultima: righe da 5 h una dopo l'altra
+        last = ug.parse_hhmm(slots[-1]["start"]) if slots else None
+        start = f"{(last[0] + 5) % 24:02d}:{last[1]:02d}" if last else "06:00"
+        slots.append({"start": start, "ping": True, "pause": False})
+        self.draw_sched_rows()
+        self.sched_set()
+
+    def sched_remove_row(self, i):
+        del self.sched["slots"][i]
+        self.draw_sched_rows()
+        self.sched_set()
+
+    def draw_sched_rows(self):
+        if not (self.sched_rows and self.sched_rows.winfo_exists()):
+            return
+        for w in self.sched_rows.winfo_children():
+            w.destroy()
+        for col, text in enumerate(("Inizio", "Fine", "Ping", "Pausa", "")):
+            tk.Label(self.sched_rows, text=text, font=("Segoe UI", 9, "bold")).grid(
+                row=0, column=col, sticky="w", padx=(0, 10))
+        if not self.sched["slots"]:
+            tk.Label(self.sched_rows, text="Nessuna riga: Aggiungi riga per pianificare le finestre.",
+                     fg="gray40").grid(row=1, column=0, columnspan=5, sticky="w")
+        for i, slot in enumerate(self.sched["slots"], 1):
+            end = tk.Label(self.sched_rows, fg="gray40")
+
+            def set_start(val, slot=slot, end=end):
+                hm = ug.parse_hhmm(val)
+                if not hm:
+                    end.configure(text="HH:MM", fg="firebrick")  # orario a meta': si salva quando e' valido
+                    return
+                slot["start"] = f"{hm[0]:02d}:{hm[1]:02d}"
+                end.configure(text=f"{(hm[0] + 5) % 24:02d}:{hm[1]:02d}", fg="gray40")
+                self.sched_set()
+
+            tk.Entry(self.sched_rows, width=6, textvariable=self.bound(tk.StringVar, slot["start"], set_start)).grid(
+                row=i, column=0, sticky="w", padx=(0, 10))
+            hm = ug.parse_hhmm(slot["start"])
+            end.configure(text=f"{(hm[0] + 5) % 24:02d}:{hm[1]:02d}" if hm else "HH:MM")
+            end.grid(row=i, column=1, sticky="w", padx=(0, 10))
+            for col, key in ((2, "ping"), (3, "pause")):
+                def toggle(on, slot=slot, key=key):
+                    slot[key] = bool(on)
+                    self.sched_set()
+                tk.Checkbutton(self.sched_rows, variable=self.bound(tk.BooleanVar, slot[key], toggle)).grid(
+                    row=i, column=col, sticky="w")
+            tk.Button(self.sched_rows, text="x", width=2, command=lambda i=i - 1: self.sched_remove_row(i)).grid(
+                row=i, column=4, sticky="w")
+        self.sched_add.configure(state="normal" if len(self.sched["slots"]) < ug.MAX_SLOTS else "disabled")
+
+    def draw_sched_status(self):
+        if not (self.sched_status and self.sched_status.winfo_exists()):
+            return
+        pc = self.cfg["claude"]
+        t = int(time.time())
+        hhmm = lambda e: time.strftime("%H:%M", time.localtime(e))  # noqa: E731
+        cur = ug.current_slot(pc, t)
+        lines = [f"Adesso: riga {hhmm(cur['start'])}-{hhmm(cur['end'])}, " + ("pausa" if cur["pause"] else "lavoro")
+                 if cur else "Adesso: fuori dalle righe"]
+        nxt = sorted(start for day in (t, t + 86400) for _k, start, s in ug.slot_instances(pc, day)
+                     if s["ping"] and start > t)
+        if nxt:
+            lines.append(f"Prossimo ping: {time.strftime('%d/%m %H:%M', time.localtime(nxt[0]))}")
+        sched_st = self.state.get("claude", {}).get("schedule") or {}
+        done = sorted((sched_st.get("done") or {}).items())[-3:]
+        if done:
+            lines.append("Ultimi ping: " + "; ".join(f"{k[5:]} {v}" for k, v in done))
+        if self.sched_msg:
+            lines.append(self.sched_msg)
+        self.sched_status.configure(text="\n".join(lines))
+
+    def sched_ping_now(self):
+        if self.sched_busy:
+            return
+        self.sched_busy, self.sched_msg = True, f"{time.strftime('%H:%M')} ping in corso (claude -p, fino a 2 minuti)..."
+
+        def work():
+            try:
+                ug.ping_now()
+                self.sched_msg = f"{time.strftime('%H:%M')} ping fatto: la finestra appare al prossimo poll"
+            except ug.PollError as e:
+                self.sched_msg = f"{time.strftime('%H:%M')} ping non fatto: {e}"
+            finally:
+                self.sched_busy, self.state_mtime = False, None
+        threading.Thread(target=work, daemon=True).start()
 
     # --- scheda Utenze ---------------------------------------------------------------
     def accounts_tab(self, nb):
@@ -1303,6 +1443,7 @@ class Widget:
                 if trim:
                     ug.trim_log()
                 ug.account_cycle()
+                ug.schedule_tick()  # ping delle finestre pianificate: claude -p, mai nel thread di Tk
             except Exception as e:  # noqa: BLE001  il thread non deve morire in silenzio
                 ug.log("widget", f"ERRORE utenze: {type(e).__name__}: {e}")
             finally:
@@ -1330,6 +1471,7 @@ class Widget:
                 except tk.TclError:
                     pass
             self.draw_sessions()
+            self.draw_sched_status()
             self.draw_accounts()
             self.background_tick(now)  # utenze e log: in un thread, mai nel thread di Tk
             for name in ug.PROVIDERS:

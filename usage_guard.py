@@ -155,12 +155,25 @@ LEGACY_BLOCK = ("http://127.0.0.1:9",)  # della versione bash: si riconosce e si
 NOWIN = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
 
 # I messaggi li legge Claude: in inglese, col tag che il CLAUDE.md riconosce
+# Le parti comuni: la pausa vale anche per quello che la sessione ha lanciato (subagent, workflow,
+# job in background, loop), che altrimenti continuerebbero a consumare
+_PAUSE_HOW = ("Pls pause the whole session: finish the step in progress and start nothing new. Pause also "
+              "everything you launched (subagents, workflows, background jobs, loops, scheduled wakeups): stop "
+              "them or tell them to stop after their current step, and launch no new ones. Write a short resume "
+              "note (done, next step, and what was running, so it can be restarted), then end your turn.")
 PAUSE_TEXT = ("[usage-guard] Claude usage {reason} (pause at {pause}%, lock at {limit}%, window resets {reset}). "
-              "Pls pause: finish the step in progress, start nothing new, write a short resume note "
-              "(done, next step), then end your turn. After the reset you will get a [usage-guard] continue message.")
-CONTINUE_TEXT = ("[usage-guard] The pause is over (usage window reset or block lifted). Continue all the paused "
-                 "or interrupted tasks, starting from your resume note if you wrote one; do not repeat completed work. "
-                 "If nothing was paused, reply \"nothing to resume\" and stop.")
+              + _PAUSE_HOW + " After the reset you will get a [usage-guard] continue message.")
+CONTINUE_TEXT = ("[usage-guard] The pause is over (usage window reset, block lifted or work window started). "
+                 "Continue all the paused or interrupted tasks, starting from your resume note if you wrote one, "
+                 "and restart the subagents, workflows and background jobs you paused; do not repeat completed "
+                 "work. If nothing was paused, reply \"nothing to resume\" and stop.")
+SLOT_PAUSE_TEXT = ("[usage-guard] Scheduled pause window ({start}-{end}). " + _PAUSE_HOW
+                   + " When the next work window starts you will get a [usage-guard] continue message.")
+# Finestre pianificate: righe con un orario d'inizio, ciascuna lunga quanto la finestra di sessione
+SLOT_SECONDS = 5 * 3600
+MAX_SLOTS = 5
+PING_GRACE = 2 * 3600  # PC spento o sospeso all'ora del ping: lo si manda al risveglio, entro 2 h
+SCHEDULE_DAYS = ("weekdays", "all")
 WORKING = ("busy", "waiting")  # le idle non si avvisano: un messaggio aprirebbe un turno
 
 PROVIDERS = ("claude", "codex", "copilot")
@@ -178,6 +191,9 @@ DEFAULTS = {
                "pause": 0, "resume": True,  # pause 0: spenta
                # mentre e' bloccato: riscrive il blocco se altri lo tolgono (ogni 2 s); file in sola lettura
                "enforce": True, "readonly": False,
+               # righe {start "HH:MM", ping, pause}: il ping avvia la finestra a quell'ora, pause tiene
+               # in pausa le chat per tutta la riga (5 h). Nessuna riga: funzione spenta
+               "schedule": {"days": "weekdays", "slots": []},
                "near": 10, "near_interval": 60},  # a meno di near punti dalla soglia, un poll ogni near_interval s
     "codex": {"enabled": False, "block": False, "limit": 100, "interval": 600,
               "config": "~/.codex/config.toml", "binary": "",
@@ -430,7 +446,22 @@ def config_errors(pc):
             re.compile(pc.get(key) or "")
         except re.error as e:
             errs.append(f"{what}: regex non valida ({e})")
+    if "schedule" in pc:
+        s = pc["schedule"] if isinstance(pc["schedule"], dict) else {}
+        if s.get("days", "weekdays") not in SCHEDULE_DAYS:
+            errs.append(f"schedule.days deve essere {', '.join(SCHEDULE_DAYS)}, e' {s.get('days')!r}")
+        bad = [x.get("start") for x in (s.get("slots") or []) if isinstance(x, dict) and not parse_hhmm(x.get("start"))]
+        if bad:
+            errs.append(f"schedule: orari non validi {bad}, formato HH:MM")
+        if len(s.get("slots") or []) > MAX_SLOTS:
+            errs.append(f"schedule: al massimo {MAX_SLOTS} righe")
     return errs
+
+
+def parse_hhmm(value):
+    """'6:00' o '06:00' -> (6, 0); None se non e' un orario."""
+    m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", str(value or "").strip())
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def save_config(cfg):
@@ -1348,10 +1379,132 @@ def message(pause, sessions):
     return results
 
 
+# --- finestre pianificate: ping e righe di pausa -----------------------------------
+def schedule_config(pc):
+    """(giorni, righe valide): le righe con un orario non valido si ignorano."""
+    s = pc.get("schedule") if isinstance(pc.get("schedule"), dict) else {}
+    days = s.get("days") if s.get("days") in SCHEDULE_DAYS else "weekdays"
+    slots = []
+    for x in (s.get("slots") or [])[:MAX_SLOTS]:
+        hm = parse_hhmm(x.get("start")) if isinstance(x, dict) else None
+        if hm:
+            slots.append({"start": f"{hm[0]:02d}:{hm[1]:02d}", "ping": bool(x.get("ping", True)),
+                          "pause": bool(x.get("pause"))})
+    return days, slots
+
+
+def slot_instances(pc, t=None):
+    """[(chiave "YYYY-MM-DD HH:MM", inizio epoch, riga)] delle righe partite ieri e oggi, secondo i giorni.
+    Ieri serve per una riga serale che finisce dopo mezzanotte (21:00 + 5 h)."""
+    days, slots = schedule_config(pc)
+    t = now() if t is None else t
+    base = datetime.fromtimestamp(t).replace(hour=0, minute=0, second=0, microsecond=0)
+    out = []
+    for back in (1, 0):
+        d = base - timedelta(days=back)
+        if days == "weekdays" and d.weekday() >= 5:
+            continue
+        for s in slots:
+            h, m = parse_hhmm(s["start"])
+            start = d.replace(hour=h, minute=m)
+            out.append((start.strftime("%Y-%m-%d %H:%M"), int(start.timestamp()), s))
+    return out
+
+
+def current_slot(pc, t=None):
+    """La riga in corso adesso (l'ultima partita fra quelle che coprono t), o None."""
+    t = now() if t is None else t
+    live = [(start, key, s) for key, start, s in slot_instances(pc, t) if start <= t < start + SLOT_SECONDS]
+    if not live:
+        return None
+    start, key, s = max(live, key=lambda x: x[0])
+    # la riga ha gia' un "start" (HH:MM): resta come "hhmm", start e' l'epoch
+    return {**s, "hhmm": s["start"], "key": key, "start": start, "end": start + SLOT_SECONDS}
+
+
+def window_open(st, t=None):
+    """Una finestra di sessione aperta: quella col reset nel futuro."""
+    t = now() if t is None else t
+    return any(w[0] == "session" and to_int(w[2]) > t for w in st.get("windows") or [])
+
+
+def ping_window(reason):
+    """Avvia la finestra di 5 h con una richiesta minima dal client ufficiale: claude -p con Haiku e
+    una parola. Niente chiamata diretta all'API col token OAuth (uso escluso dall'utente il 2026-11-13)."""
+    exe = shutil.which("claude")
+    if not exe:
+        raise PollError("claude non trovato nel PATH")
+    cmd = [exe, "-p", "ok", "--model", "haiku", "--max-turns", "1", "--no-session-persistence"]
+    try:
+        p = subprocess.run(cmd, cwd=tempfile.gettempdir(), stdin=subprocess.DEVNULL, capture_output=True,
+                           timeout=POLL_TIMEOUT, creationflags=NOWIN)
+    except subprocess.TimeoutExpired:
+        raise PollError(f"ping: claude -p oltre {POLL_TIMEOUT}s")
+    except OSError as e:
+        raise PollError(f"ping: claude non avviabile: {e}")
+    if p.returncode:
+        err = (p.stderr or p.stdout).decode("utf-8", "replace").strip()
+        raise PollError(f"ping: claude -p rc={p.returncode}: {err[:200]}")
+    log("claude", f"PING ({reason}): finestra avviata con claude -p (haiku)")
+    update_state("claude", poll_epoch=0)  # il prossimo tick rilegge l'uso e vede la finestra nuova
+
+
+def ping_now():
+    """Il pulsante "Avvia finestra ora": salta solo col blocco attivo."""
+    if load_state().get("claude", {}).get("blocked") == 1:
+        raise PollError("blocco attivo: niente ping")
+    ping_window("a mano")
+
+
+def schedule_tick(cfg=None):
+    """I ping pianificati: a ogni riga con ping, all'orario o al risveglio entro PING_GRACE, una volta
+    per giorno. Si salta con il blocco attivo o con una finestra gia' aperta. Lo chiamano il widget
+    (in un thread) e il loop: un lock tiene un ping alla volta."""
+    cfg = cfg or load_config()
+    pc = cfg["claude"]
+    if not pc.get("enabled") or not schedule_config(pc)[1]:
+        return
+    try:
+        with dir_lock(os.path.join(DIR, "usage-guard.schedule.lock"), stale=POLL_TIMEOUT + 30, wait=0):
+            _schedule_tick(pc)
+    except Busy:
+        return
+
+
+def _schedule_tick(pc):
+    st = load_state().get("claude", {})
+    sched = st.get("schedule") if isinstance(st.get("schedule"), dict) else {}
+    done = dict(sched.get("done") or {})
+    t = now()
+    changed = False
+    for key, start, s in slot_instances(pc, t):
+        if not s["ping"] or key in done or not start <= t <= start + PING_GRACE:
+            continue
+        if st.get("blocked") == 1:
+            result = "saltato: blocco attivo"
+        elif window_open(st, t):
+            result = "saltato: finestra gia' aperta"
+        else:
+            try:
+                ping_window(f"riga {s['start']}")
+                result = "ok"
+            except PollError as e:
+                result = f"errore: {e}"
+        if result != "ok":
+            log("claude", f"PING riga {s['start']} {result}")
+        done[key], changed = f"{stamp()[11:16]} {result}", True
+    cutoff = (datetime.fromtimestamp(t) - timedelta(days=2)).strftime("%Y-%m-%d")
+    kept = {k: v for k, v in done.items() if k >= cutoff}
+    if changed or kept != done:
+        update_state("claude", schedule={**sched, "done": kept})
+
+
 def pause_step(pc, r, st, locked, just_locked):
     """Al pause% le chat al lavoro ricevono la pausa; al blocco si registrano anche quelle che il
     blocco interrompe. Sotto la soglia e senza blocco la finestra e' nuova: il continue va alle
-    registrate ancora vive. Ritorna i campi di state e l'invio, (tipo, destinatari, testo) o None."""
+    registrate ancora vive. Una riga di pausa delle finestre pianificate mette in pausa chi lavora
+    al suo inizio e trattiene il continue finche' dura. Ritorna i campi di state e l'invio,
+    (tipo, destinatari, testo) o None."""
     skip = re.compile(pc["skip"], re.I) if pc.get("skip") else None
     hit = [w for w in r["windows"] if pc["pause"] and w[1] >= pc["pause"] and not (skip and skip.search(w[0]))]
     reg = st.get("paused_sessions") or []
@@ -1363,13 +1516,27 @@ def pause_step(pc, r, st, locked, just_locked):
         fields.update(pause_reason=reason, pause_resets=resets, paused_sessions=reg)
         log("claude", f"PAUSA: {reason}, avviso le chat al lavoro: {ids(working)}")
         action = ("pausa", working, pause_text(pc, reason, resets))
+    slot = current_slot(pc)
+    pausing = bool(slot and slot["pause"])
+    if pausing and st.get("slot_paused") != slot["key"]:
+        # inizio di una riga di pausa: chi lavora e non e' gia' in pausa la riceve, una volta per riga
+        known = {skey(s) for s in reg}
+        working = [s for s in auto_targets(pc) if skey(s) not in known]
+        reg = merge(reg, working)
+        span = f"{time.strftime('%H:%M', time.localtime(slot['start']))}-{time.strftime('%H:%M', time.localtime(slot['end']))}"
+        fields.update(slot_paused=slot["key"], paused_sessions=reg,
+                      pause_reason=fields.get("pause_reason") or st.get("pause_reason") or f"finestra di pausa {span}")
+        log("claude", f"PAUSA: finestra pianificata {span}, avviso le chat al lavoro: {ids(working)}")
+        if working and not action:
+            action = ("pausa", working, SLOT_PAUSE_TEXT.format(start=span[:5], end=span[6:]))
     if just_locked and pc["resume"]:
         stopped = auto_targets(pc)
         log("claude", f"BLOCCO: per il continue registro anche {ids(stopped)}")
         reg = merge(reg, stopped)
         fields.update(paused_sessions=reg, lock_epoch=now(),
                       pause_reason=fields.get("pause_reason") or st.get("pause_reason") or "blocco")
-    if not hit and not locked and st.get("pause_reason"):
+    if not hit and not locked and st.get("pause_reason") and not pausing:
+        # Dentro una riga di pausa il continue aspetta: parte al primo poll della riga di lavoro dopo.
         # Chi ha aperto un turno durante il blocco (un prompt, la notifica di un job in background)
         # e' rimasto fermo su ECONNREFUSED: lo dice il cambio di stato dopo l'inizio del blocco
         since = to_int(st.get("lock_epoch"))
@@ -2286,6 +2453,7 @@ def loop(only):
         for name in on:
             poll(name)
         account_cycle()  # fa rete solo per le utenze in scadenza o col poll dovuto
+        schedule_tick(cfg)  # i ping delle finestre pianificate, se e' l'ora
         # Si dorme fino al primo provider in scadenza: se il widget fa il poll prima,
         # al risveglio lo state e' fresco e il turno salta
         st, t = load_state(), now()
