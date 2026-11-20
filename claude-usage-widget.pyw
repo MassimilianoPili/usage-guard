@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import traceback
+from datetime import datetime, timedelta
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
@@ -64,13 +65,19 @@ DEFAULTS = {
     "transp": 0, "font": 9, "topmost": True, "warn": 80,
     "dock": "free", "align": "right", "valign": "top", "text_align": "center",
     "margin_x": 8, "margin_y": 8, "pad_x": 5, "pad_y": 2,
+    # caffeina: tiene sveglio il PC e/o il monitor finche' la si spegne, per N ore o fino a un'ora.
+    # Nelle preferenze del widget perche' la tiene il suo processo; al riavvio torna com'era
+    "caff_on": False, "caff_system": True, "caff_display": True, "caff_ac_only": False,
+    "caff_mode": "forever", "caff_hours": 2, "caff_until": "18:00", "caff_ends": 0,
 }
 # Un valore fuori range e' una digitazione a meta' (1 verso 120): non si applica
 # font da 1: in Tk 0 e' il font di default e un negativo e' in pixel
 RANGES = {"transp": (0, 100), "font": (1, 20), "warn": (1, 100),
-          "margin_x": (0, 400), "margin_y": (0, 400), "pad_x": (0, 50), "pad_y": (0, 50)}
+          "margin_x": (0, 400), "margin_y": (0, 400), "pad_x": (0, 50), "pad_y": (0, 50),
+          "caff_hours": (1, 72)}
 CHOICES = {"dock": ("free",) + tuple(DOCKS), "align": ("left", "center", "right"),
-           "valign": ("top", "bottom"), "text_align": ("left", "center", "right")}
+           "valign": ("top", "bottom"), "text_align": ("left", "center", "right"),
+           "caff_mode": ("forever", "hours", "until")}
 SHARE = {"left": 0, "top": 0, "center": 0.5, "right": 1, "bottom": 1}  # quota del box prima del punto fisso
 TEXT_ANCHOR = {"left": "w", "center": "center", "right": "e"}
 ALIGN_NAMES = (("left", "Sinistra"), ("center", "Centro"), ("right", "Destra"))
@@ -115,6 +122,11 @@ def load_prefs():
             prefs[key] = DEFAULTS[key]
     if prefs["dock"] in DOCKS:
         prefs["align"], prefs["valign"] = DOCKS[prefs["dock"]]  # agganciato: i lati li da' il punto
+    if not ug.parse_hhmm(prefs["caff_until"]):
+        prefs["caff_until"] = DEFAULTS["caff_until"]
+    for key in ("caff_on", "caff_system", "caff_display", "caff_ac_only"):
+        prefs[key] = bool(prefs[key])
+    prefs["caff_ends"] = num(prefs["caff_ends"])
     return prefs
 
 
@@ -163,6 +175,84 @@ if IS_WIN:
     K32.OpenProcess.restype = ctypes.c_void_p
     K32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     K32.CloseHandle.argtypes = [ctypes.c_void_p]
+    K32.SetThreadExecutionState.restype = ctypes.c_uint
+    K32.SetThreadExecutionState.argtypes = [ctypes.c_uint]
+
+    class SYSTEM_POWER_STATUS(ctypes.Structure):
+        _fields_ = [("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+                    ("BatteryLifePercent", ctypes.c_ubyte), ("SystemStatusFlag", ctypes.c_ubyte),
+                    ("BatteryLifeTime", wintypes.DWORD), ("BatteryFullLifeTime", wintypes.DWORD)]
+
+    K32.GetSystemPowerStatus.argtypes = [ctypes.POINTER(SYSTEM_POWER_STATUS)]
+
+CAFF_MARK = "☀"  # caffeina attiva: nel titolo della scheda e in fondo alla prima riga
+ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED = 0x80000000, 0x00000001, 0x00000002
+
+
+class Awake:
+    """Tiene sveglio il PC e/o il monitor con l'API del sistema, quella dei lettori video e delle
+    presentazioni: su Windows SetThreadExecutionState (vale finche' il thread di Tk vive, e il
+    processo che esce la toglie da solo), su macOS caffeinate, su Linux systemd-inhibit; questi due
+    legati al pid del widget, cosi' non restano accesi se il widget muore.
+    Non tocca il blocco schermo della policy: quello resta, ed e' giusto che resti."""
+
+    def __init__(self):
+        self.flags, self.proc = (False, False), None
+
+    def set(self, system, display):
+        if (system, display) == self.flags:
+            return
+        self.flags = (system, display)
+        if IS_WIN:
+            K32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if system else 0)
+                                        | (ES_DISPLAY_REQUIRED if display else 0))
+            return
+        if self.proc:  # macOS/Linux: non verificato su quelle piattaforme
+            with contextlib.suppress(OSError):
+                self.proc.terminate()
+            self.proc = None
+        if not (system or display):
+            return
+        if IS_MAC:
+            cmd = ["caffeinate", "-w", str(os.getpid())] + (["-i"] if system else []) + (["-d"] if display else [])
+        else:
+            what = ":".join(w for w, on in (("sleep", system), ("idle", display or system)) if on)
+            cmd = ["systemd-inhibit", f"--what={what}", "--who=usage-guard", "--why=caffeina", "--mode=block",
+                   "tail", f"--pid={os.getpid()}", "-f", "/dev/null"]
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+        except OSError as e:
+            ug.log("widget", f"ERRORE caffeina: {cmd[0]} non avviabile: {e}")
+
+
+_ac_cache = [0, True]  # (quando, valore): su macOS e Linux la lettura costa un processo o dei file
+
+
+def on_ac_power():
+    """Vero con l'alimentatore collegato, o se non si sa (un fisso non ha batteria)."""
+    if IS_WIN:
+        s = SYSTEM_POWER_STATUS()
+        if K32.GetSystemPowerStatus(ctypes.byref(s)):
+            return s.ACLineStatus != 0  # 1 collegato, 255 sconosciuto
+        return True
+    if time.time() - _ac_cache[0] < 60:
+        return _ac_cache[1]
+    value = True
+    try:
+        if IS_MAC:
+            out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=5).stdout
+            value = "AC Power" in out or "Battery Power" not in out
+        else:
+            import glob
+            mains = [p for p in glob.glob("/sys/class/power_supply/*") if
+                     open(os.path.join(p, "type"), encoding="utf-8").read().strip() == "Mains"]
+            if mains:
+                value = any(open(os.path.join(p, "online"), encoding="utf-8").read().strip() == "1" for p in mains)
+    except (OSError, subprocess.SubprocessError):
+        value = True
+    _ac_cache[:] = [time.time(), value]
+    return value
 
 
 def monitor_rect(x, y):
@@ -255,6 +345,8 @@ class Widget:
         self.bg_running, self.bg_last, self.trim_last = False, 0, 0  # trim_last 0: il log si taglia subito
         self.sched, self.sched_rows, self.sched_status, self.sched_add = None, None, None, None
         self.sched_msg, self.sched_busy = "", False
+        self.awake, self.caff_vars, self.caff_shown_active = Awake(), {}, False
+        self.caff_nb, self.caff_tab_id, self.caff_status = None, None, None
         # scheda Sessioni: il thread d'invio scrive solo sess_msg e sess_busy
         self.sess_list, self.sess_shown, self.sess_sel, self.sess_by_key = None, None, set(), {}
         self.sess_msg, self.sess_busy, self.sess_buttons, self.sess_result = "", False, [], None
@@ -509,6 +601,8 @@ class Widget:
         # i disegni, il campo aperto e la tabella delle sessioni erano della finestra chiusa
         self.dock_canvas = self.box_canvas = self.edit_close = self.sess_list = self.acct_list = None
         self.sched_rows = self.sched_status = None
+        self.caff_nb = self.caff_tab_id = self.caff_status = None
+        self.caff_vars = {}
         self.acct_shown = None
         self.editing = False
         w.withdraw()  # si mostra dopo, gia' al suo posto
@@ -527,6 +621,7 @@ class Widget:
         nb.insert(tabs["codex"], self.sessions_tab(nb))  # subito dopo Claude
         nb.insert(tabs["codex"], self.schedule_tab(nb))  # le finestre pianificate, dopo Sessioni
         nb.insert(tabs["codex"], self.accounts_tab(nb))  # poi Utenze, prima di Codex
+        self.caffeine_tab(nb)
         self.update_tab(nb)
         if first:
             nb.select(tabs["claude"])
@@ -998,6 +1093,122 @@ class Widget:
                 self.acct_msg.configure(text=str(e))
             self.acct_shown = None
         threading.Thread(target=work, daemon=True).start()
+
+    # --- caffeina: PC e monitor svegli -------------------------------------------------
+    def caff_active(self, now=None):
+        """(attiva, motivo se sospesa): accesa e nella durata, e con l'alimentatore se richiesto."""
+        p, now = self.p, time.time() if now is None else now
+        if not p["caff_on"]:
+            return False, ""
+        if p["caff_mode"] != "forever" and p["caff_ends"] and now >= p["caff_ends"]:
+            return False, "scaduta"
+        if p["caff_ac_only"] and not on_ac_power():
+            return False, "a batteria"
+        return True, ""
+
+    def caff_end(self):
+        """Fine della durata scelta: per N ore da adesso, o la prossima HH:MM."""
+        p, now = self.p, time.time()
+        if p["caff_mode"] == "hours":
+            return int(now + p["caff_hours"] * 3600)
+        if p["caff_mode"] == "until":
+            h, m = ug.parse_hhmm(p["caff_until"])
+            end = datetime.fromtimestamp(now).replace(hour=h, minute=m, second=0, microsecond=0)
+            if end.timestamp() <= now:
+                end += timedelta(days=1)
+            return int(end.timestamp())
+        return 0
+
+    def caff_set(self, key, value):
+        """Ogni modifica della scheda: accendere o cambiare la durata ricalcola la fine."""
+        if key in RANGES and not RANGES[key][0] <= value <= RANGES[key][1]:
+            return
+        if key == "caff_until" and not ug.parse_hhmm(value):
+            return  # orario a meta'
+        if self.p.get(key) == value:
+            return  # la casella rimessa a mano dal tick (durata finita): gia' fatto
+        self.p[key] = value
+        if self.p["caff_on"] and key in ("caff_on", "caff_mode", "caff_hours", "caff_until"):
+            self.p["caff_ends"] = self.caff_end()
+        if key == "caff_on":
+            ug.log("widget", "caffeina " + ("accesa" if value else "spenta"))
+        self.save_prefs()
+        self.caff_tick(time.time())
+        self.shown = None  # il segno nella riga cambia subito
+
+    def caff_tick(self, now):
+        """Dal tick, nel thread di Tk (SetThreadExecutionState vale per il thread che la chiama)."""
+        p = self.p
+        active, why = self.caff_active(now)
+        if why == "scaduta":
+            p["caff_on"], p["caff_ends"] = False, 0
+            self.save_prefs()
+            ug.log("widget", "caffeina spenta: durata finita")
+            if self.caff_vars.get("caff_on") is not None:
+                with contextlib.suppress(tk.TclError):
+                    self.caff_vars["caff_on"].set(False)
+        self.awake.set(active and p["caff_system"], active and p["caff_display"])
+        if active != self.caff_shown_active:
+            self.caff_shown_active, self.shown = active, None
+        self.draw_caff_status(active, why)
+
+    def caffeine_tab(self, nb):
+        tab = tk.Frame(nb, padx=10, pady=6)
+        nb.add(tab, text="Caffeina")
+        self.caff_nb, self.caff_tab_id = nb, nb.tabs()[-1]
+        p = self.p
+        self.caff_vars = {}
+
+        def var(kind, key):
+            v = self.caff_vars[key] = self.bound(kind, p[key], lambda val, key=key: self.caff_set(key, val))
+            return v
+
+        tk.Checkbutton(tab, text="Attiva", font=("Segoe UI", 9, "bold"), variable=var(tk.BooleanVar, "caff_on")).grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        box = tk.LabelFrame(tab, text="Cosa", padx=8, pady=4)
+        box.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        for key, text in (("caff_system", "PC sveglio: niente sospensione"),
+                          ("caff_display", "Monitor acceso"),
+                          ("caff_ac_only", "Solo con l'alimentatore collegato")):
+            tk.Checkbutton(box, text=text, variable=var(tk.BooleanVar, key)).pack(anchor="w")
+        box = tk.LabelFrame(tab, text="Durata", padx=8, pady=4)
+        box.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        mode = var(tk.StringVar, "caff_mode")
+        tk.Radiobutton(box, text="Finche' non la spengo", value="forever", variable=mode).grid(row=0, column=0, sticky="w")
+        tk.Radiobutton(box, text="Per", value="hours", variable=mode).grid(row=1, column=0, sticky="w")
+        tk.Spinbox(box, from_=1, to=72, width=4, textvariable=var(tk.IntVar, "caff_hours")).grid(row=1, column=1, sticky="w")
+        tk.Label(box, text="ore").grid(row=1, column=2, sticky="w")
+        tk.Radiobutton(box, text="Fino alle", value="until", variable=mode).grid(row=2, column=0, sticky="w")
+        tk.Entry(box, width=6, textvariable=var(tk.StringVar, "caff_until")).grid(row=2, column=1, sticky="w")
+        self.caff_status = tk.Label(tab, fg="gray40", justify="left")
+        self.caff_status.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        tk.Label(tab, text="Usa l'API del sistema (come i video e le presentazioni). Il blocco schermo della\n"
+                           "policy aziendale resta: dopo l'inattivita' lo schermo si blocca lo stesso, ma il PC\n"
+                           "non va in sospensione e le sessioni di Claude continuano a lavorare.\n"
+                           "Vale mentre il widget e' aperto; alla riapertura torna com'era.",
+                 fg="gray40", justify="left").grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.caff_tick(time.time())
+        return tab
+
+    def draw_caff_status(self, active, why):
+        title = f"Caffeina {CAFF_MARK}" if active else "Caffeina"
+        if self.caff_nb:
+            with contextlib.suppress(tk.TclError):
+                self.caff_nb.tab(self.caff_tab_id, text=title)
+        if not (self.caff_status and self.caff_status.winfo_exists()):
+            return
+        p = self.p
+        if active:
+            what = ", ".join(t for t, on in (("PC sveglio", p["caff_system"]), ("monitor acceso", p["caff_display"])) if on)
+            when = ("finche' non la spegni" if p["caff_mode"] == "forever" else
+                    f"fino alle {time.strftime('%d/%m %H:%M', time.localtime(p['caff_ends']))}, "
+                    f"fra {ug.fmt_left(max(0, p['caff_ends'] - time.time()))}")
+            text = f"Attiva: {what or 'niente da tenere sveglio'}, {when}."
+        elif p["caff_on"] and why == "a batteria":
+            text = "Accesa ma sospesa: il PC e' a batteria (Solo con l'alimentatore)."
+        else:
+            text = "Spenta: valgono i tempi normali di sospensione e spegnimento del monitor."
+        self.caff_status.configure(text=text)
 
     def update_tab(self, nb):
         box = tk.Frame(nb, padx=10, pady=6)
@@ -1472,6 +1683,7 @@ class Widget:
                     pass
             self.draw_sessions()
             self.draw_sched_status()
+            self.caff_tick(now)  # nel thread di Tk: lo stato di veglia vale per il thread che lo chiede
             self.draw_accounts()
             self.background_tick(now)  # utenze e log: in un thread, mai nel thread di Tk
             for name in ug.PROVIDERS:
@@ -1584,7 +1796,10 @@ class Widget:
             rows.append(segs)
         if not rows:
             rows.append([("nessun provider attivo: tasto destro, Impostazioni", DIM, False)])
-        # il segno di aggiornamento sta nel titolo della scheda Aggiornamenti, non nella riga del widget
+        # il segno di aggiornamento sta nel titolo della scheda Aggiornamenti, non nella riga del widget;
+        # quello della caffeina anche in fondo alla prima riga
+        if self.caff_shown_active:
+            rows[0] = rows[0] + [(CAFF_MARK, DIM, False)]
         if self.cfg_err:
             rows.append([(self.cfg_err[:80], WARN, False)])
         if (blocked, rows) == self.shown:
