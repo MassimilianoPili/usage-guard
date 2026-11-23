@@ -852,9 +852,9 @@ class Widget:
         tk.Button(bar, text="Avvia finestra ora", command=self.sched_ping_now).pack(side="left", padx=(6, 0))
         self.sched_status = tk.Label(tab, fg="gray40", justify="left")
         self.sched_status.grid(row=3, column=0, sticky="w", pady=(6, 0))
-        tk.Label(tab, text="Ogni riga dura 5 h, come la finestra di sessione. Ping: all'orario (o al risveglio\n"
-                           "del PC, entro 2 h) una richiesta minima con claude -p e Haiku avvia la finestra;\n"
-                           "niente ping con una finestra gia' aperta o col blocco attivo.\n"
+        tk.Label(tab, text="Ogni riga dura 5 h, come la finestra di sessione. Ping: all'orario, o il prima\n"
+                           "possibile dentro la riga, una richiesta minima con claude -p e Haiku avvia la finestra.\n"
+                           "Con una finestra gia' aperta o col blocco attivo aspetta, e parte appena finisce.\n"
                            "Pausa: all'inizio della riga le chat al lavoro vanno in pausa (subagent e workflow\n"
                            "compresi), e il continue aspetta la prima riga di lavoro dopo.\n"
                            "Nessuna riga: funzione spenta.",
@@ -939,6 +939,8 @@ class Widget:
         if nxt:
             lines.append(f"Prossimo ping: {time.strftime('%d/%m %H:%M', time.localtime(nxt[0]))}")
         sched_st = self.state.get("claude", {}).get("schedule") or {}
+        for key, why in sorted((sched_st.get("wait") or {}).items()):
+            lines.append(f"In attesa: ping della riga {key[11:]}, {why}")
         done = sorted((sched_st.get("done") or {}).items())[-3:]
         if done:
             lines.append("Ultimi ping: " + "; ".join(f"{k[5:]} {v}" for k, v in done))

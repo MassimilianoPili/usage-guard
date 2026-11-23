@@ -172,7 +172,6 @@ SLOT_PAUSE_TEXT = ("[usage-guard] Scheduled pause window ({start}-{end}). " + _P
 # Finestre pianificate: righe con un orario d'inizio, ciascuna lunga quanto la finestra di sessione
 SLOT_SECONDS = 5 * 3600
 MAX_SLOTS = 5
-PING_GRACE = 2 * 3600  # PC spento o sospeso all'ora del ping: lo si manda al risveglio, entro 2 h
 SCHEDULE_DAYS = ("weekdays", "all")
 WORKING = ("busy", "waiting")  # le idle non si avvisano: un messaggio aprirebbe un turno
 
@@ -1457,9 +1456,11 @@ def ping_now():
 
 
 def schedule_tick(cfg=None):
-    """I ping pianificati: a ogni riga con ping, all'orario o al risveglio entro PING_GRACE, una volta
-    per giorno. Si salta con il blocco attivo o con una finestra gia' aperta. Lo chiamano il widget
-    (in un thread) e il loop: un lock tiene un ping alla volta."""
+    """I ping pianificati: a ogni riga con ping, all'orario o il prima possibile, una volta per riga e
+    giorno. Con una finestra gia' aperta o col blocco attivo il ping aspetta e parte appena la finestra
+    finisce, se si e' ancora dentro la riga (prima si saltava: il 2026-11-23 la riga 06:00 trovo' la
+    finestra 02-07 aperta e non ripingo' alle 07). Lo chiamano il widget (in un thread) e il loop:
+    un lock tiene un ping alla volta."""
     cfg = cfg or load_config()
     pc = cfg["claude"]
     if not pc.get("enabled") or not schedule_config(pc)[1]:
@@ -1475,28 +1476,48 @@ def _schedule_tick(pc):
     st = load_state().get("claude", {})
     sched = st.get("schedule") if isinstance(st.get("schedule"), dict) else {}
     done = dict(sched.get("done") or {})
+    wait = dict(sched.get("wait") or {})    # riga -> perche' aspetta (per la scheda e per loggare una volta)
+    retry = dict(sched.get("retry") or {})  # riga -> epoch del prossimo tentativo dopo un errore
     t = now()
-    changed = False
+    before = (done, wait, retry)
+    done, wait, retry = dict(done), dict(wait), dict(retry)
+    live = set()
     for key, start, s in slot_instances(pc, t):
-        if not s["ping"] or key in done or not start <= t <= start + PING_GRACE:
-            continue
+        if not s["ping"] or key in done or not start <= t < start + SLOT_SECONDS:
+            continue  # fatta, o fuori dalla riga: alla fine della riga il ping non serve piu'
+        live.add(key)
+        reason = ""
         if st.get("blocked") == 1:
-            result = "saltato: blocco attivo"
+            reason = "blocco attivo"
         elif window_open(st, t):
-            result = "saltato: finestra gia' aperta"
-        else:
-            try:
-                ping_window(f"riga {s['start']}")
-                result = "ok"
-            except PollError as e:
-                result = f"errore: {e}"
-        if result != "ok":
-            log("claude", f"PING riga {s['start']} {result}")
-        done[key], changed = f"{stamp()[11:16]} {result}", True
+            until = max(to_int(w[2]) for w in st.get("windows") or [] if w[0] == "session")
+            reason = f"finestra aperta fino alle {time.strftime('%H:%M', time.localtime(until))}"
+        if reason:
+            if wait.get(key) != reason:
+                log("claude", f"PING riga {s['start']} in attesa: {reason}, parte appena finisce")
+            wait[key] = reason
+            continue
+        if t < to_int(retry.get(key)):
+            continue
+        try:
+            ping_window(f"riga {s['start']}" + (", dopo l'attesa" if key in wait else ""))
+            done[key] = f"{stamp()[11:16]} ok" + (" dopo l'attesa" if key in wait else "")
+            wait.pop(key, None)
+            retry.pop(key, None)
+        except PollError as e:
+            retry[key] = t + 600
+            if wait.get(key) != f"errore: {e}":
+                log("claude", f"PING riga {s['start']} errore: {e} (riprovo fra 10 minuti)")
+            wait[key] = f"errore: {e}"
+    # righe finite senza ping: restano nel registro come "non partito", per la scheda
+    for key in list(wait):
+        if key not in live and key not in done:
+            done[key] = f"non partito: {wait.pop(key)}"
+            retry.pop(key, None)
     cutoff = (datetime.fromtimestamp(t) - timedelta(days=2)).strftime("%Y-%m-%d")
-    kept = {k: v for k, v in done.items() if k >= cutoff}
-    if changed or kept != done:
-        update_state("claude", schedule={**sched, "done": kept})
+    done = {k: v for k, v in done.items() if k >= cutoff}
+    if (done, wait, retry) != before:
+        update_state("claude", schedule={**sched, "done": done, "wait": wait, "retry": retry})
 
 
 def pause_step(pc, r, st, locked, just_locked):
